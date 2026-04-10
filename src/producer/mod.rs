@@ -1,14 +1,23 @@
-use crate::queue::models::Task;
+use crate::queue::{self, models::Job};
+use std::sync::Arc;
 
 pub trait Producer {
-    fn produce(&self, task: Task) -> Result<(), String>;
+    fn produce(&self, job: Job) -> Result<(), String>;
 }
 
-pub struct JobProducer;
+pub struct JobProducer {
+    queue: Arc<queue::Queue>,
+}
+
+impl JobProducer {
+    pub fn new(queue: Arc<queue::Queue>) -> Self {
+        JobProducer { queue }
+    }
+}
 
 impl Producer for JobProducer {
-    fn produce(&self, task: Task) -> Result<(), String> {
-        // Logic to add the task to the queue
+    fn produce(&self, job: Job) -> Result<(), String> {
+        self.queue.enqueue(job);
         Ok(())
     }
 }
