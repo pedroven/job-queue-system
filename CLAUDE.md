@@ -2,7 +2,7 @@
 
 ## Overview
 
-An in-memory job queue system built in Rust with a producer-consumer architecture using multithreaded workers.
+A job queue system built in Rust with a producer-consumer architecture using multithreaded workers. Jobs are persisted to SQLite so pending work survives restarts.
 
 ## Build & Run
 
@@ -25,6 +25,7 @@ cargo clippy
 - `src/queue/models.rs` — Data models: `Job`, `Task`, `Worker`, `DeadLetterJob`, and their status enums.
 - `src/producer/mod.rs` — `Producer` trait and `JobProducer` implementation that enqueues jobs.
 - `src/consumer/mod.rs` — `Consumer` trait and `JobConsumer` implementation that processes jobs.
+- `src/persistence/mod.rs` — `JobRepository` trait with `SqliteJobRepository` (production) and `InMemoryJobRepository` (tests).
 
 ## Test
 
@@ -47,7 +48,7 @@ Always run `cargo test` before considering a change complete.
 ## Conventions
 
 - Rust 2024 edition.
-- No external dependencies — uses only `std`.
+- `rusqlite` (with `bundled` feature) for SQLite persistence — the only external dependency.
 - Concurrency via `Arc<Mutex<T>>` and `Condvar` (no async runtime).
 - Traits (`Producer`, `Consumer`) define the public interfaces for producing and consuming jobs.
 - Keep methods short and focused — extract helpers for distinct logical steps.
