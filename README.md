@@ -31,6 +31,22 @@ cargo run
 
 The program starts worker threads and prompts for payloads via stdin. Each payload is wrapped into a job and dispatched to an available worker.
 
+### Test
+
+```sh
+cargo test
+```
+
+## Development Workflow (TDD)
+
+This project follows Test-Driven Development:
+
+1. **Red** — Write a failing test that describes the expected behavior.
+2. **Green** — Write the minimal code to make the test pass.
+3. **Refactor** — Clean up the implementation while keeping tests green.
+
+Tests are colocated in each module using `#[cfg(test)]` blocks. Always run `cargo test` before considering a change complete.
+
 ## Architecture
 
 ```

@@ -26,6 +26,24 @@ cargo clippy
 - `src/producer/mod.rs` — `Producer` trait and `JobProducer` implementation that enqueues jobs.
 - `src/consumer/mod.rs` — `Consumer` trait and `JobConsumer` implementation that processes jobs.
 
+## Test
+
+```sh
+cargo test
+```
+
+Tests are colocated in each module using `#[cfg(test)]` blocks.
+
+## Development Workflow (TDD)
+
+Follow Test-Driven Development when adding new features or fixing bugs:
+
+1. **Red** — Write a failing test that describes the expected behavior.
+2. **Green** — Write the minimal code to make the test pass.
+3. **Refactor** — Clean up the implementation while keeping tests green.
+
+Always run `cargo test` before considering a change complete.
+
 ## Conventions
 
 - Rust 2024 edition.
