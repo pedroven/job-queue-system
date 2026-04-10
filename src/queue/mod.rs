@@ -42,29 +42,39 @@ impl Queue {
             let jobs = Arc::clone(&self.jobs);
             thread::spawn(move || {
                 loop {
-                    let job = {
-                        let (lock, cvar) = &*jobs;
-                        let mut jobs = lock.lock().unwrap();
-                        while jobs.is_empty() {
-                            jobs = cvar.wait(jobs).unwrap();
-                        }
-                        jobs.pop_front()
-                    };
+                    let job = Self::wait_for_job(&jobs);
                     if let Some(job) = job {
-                        {
-                            let mut w = worker.lock().unwrap();
-                            w.status = models::WorkerStatus::Busy;
-                            w.current_job_id = Some(job.id.clone());
-                        }
-                        consumer.consume(job).unwrap();
-                        {
-                            let mut w = worker.lock().unwrap();
-                            w.status = models::WorkerStatus::Idle;
-                            w.current_job_id = None;
-                        }
+                        Self::process_job(&worker, &consumer, job);
                     }
                 }
             });
+        }
+    }
+
+    fn wait_for_job(jobs: &(Mutex<VecDeque<models::Job>>, Condvar)) -> Option<models::Job> {
+        let (lock, cvar) = jobs;
+        let mut jobs = lock.lock().unwrap();
+        while jobs.is_empty() {
+            jobs = cvar.wait(jobs).unwrap();
+        }
+        jobs.pop_front()
+    }
+
+    fn process_job(
+        worker: &Mutex<models::Worker>,
+        consumer: &consumer::JobConsumer,
+        job: models::Job,
+    ) {
+        {
+            let mut w = worker.lock().unwrap();
+            w.status = models::WorkerStatus::Busy;
+            w.current_job_id = Some(job.id.clone());
+        }
+        consumer.consume(job).unwrap();
+        {
+            let mut w = worker.lock().unwrap();
+            w.status = models::WorkerStatus::Idle;
+            w.current_job_id = None;
         }
     }
 }
