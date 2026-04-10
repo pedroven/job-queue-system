@@ -3,7 +3,7 @@ use std::time::SystemTime;
 
 use crate::error::QueueError;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum JobStatus {
     Pending,
     Running,
@@ -48,7 +48,7 @@ pub struct Job {
     pub status: JobStatus,
     pub retry_count: u32,
     pub task: Task,
-    pub max_retries: u32,
+    pub max_attempts: u32,
     pub created_at: SystemTime,
 }
 
@@ -62,13 +62,13 @@ impl Job {
             id,
             status: JobStatus::Pending,
             retry_count: 0,
-            max_retries: 3,
+            max_attempts: 3,
             created_at: SystemTime::now(),
         }
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DeadLetterJob {
     pub id: String,
     pub original_job_id: String,
