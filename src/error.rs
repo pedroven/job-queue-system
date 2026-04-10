@@ -7,6 +7,7 @@ pub enum QueueError {
     NotFound(String),
     AlreadyExists(String),
     InvalidStatus(String),
+    JobFailed(String),
 }
 
 impl fmt::Display for QueueError {
@@ -17,6 +18,7 @@ impl fmt::Display for QueueError {
             QueueError::NotFound(id) => write!(f, "job not found: {id}"),
             QueueError::AlreadyExists(id) => write!(f, "job already exists: {id}"),
             QueueError::InvalidStatus(s) => write!(f, "invalid status: {s}"),
+            QueueError::JobFailed(msg) => write!(f, "job failed: {msg}"),
         }
     }
 }
