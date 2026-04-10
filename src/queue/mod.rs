@@ -28,6 +28,12 @@ impl Queue {
         }
     }
 
+    pub fn len(&self) -> usize {
+        let (lock, _) = &*self.jobs;
+        let jobs = lock.lock().unwrap();
+        jobs.len()
+    }
+
     pub fn enqueue(&self, job: models::Job) {
         let (lock, cvar) = &*self.jobs;
         let mut jobs = lock.lock().unwrap();
@@ -76,5 +82,136 @@ impl Queue {
             w.status = models::WorkerStatus::Idle;
             w.current_job_id = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn make_job(id: &str, payload: &str) -> models::Job {
+        models::Job {
+            id: id.to_string(),
+            status: models::JobStatus::Pending,
+            retry_count: 0,
+            task: models::Task {
+                id: format!("task-{}", id),
+                payload: payload.to_string(),
+            },
+            max_retries: 3,
+            created_at: std::time::SystemTime::now(),
+        }
+    }
+
+    #[test]
+    fn test_queue_new_creates_correct_number_of_workers() {
+        let queue = Queue::new(4);
+        assert_eq!(queue.workers.len(), 4);
+    }
+
+    #[test]
+    fn test_queue_new_workers_start_idle() {
+        let queue = Queue::new(2);
+        for worker in &queue.workers {
+            let w = worker.lock().unwrap();
+            assert!(matches!(w.status, models::WorkerStatus::Idle));
+            assert!(w.current_job_id.is_none());
+        }
+    }
+
+    #[test]
+    fn test_queue_new_zero_workers() {
+        let queue = Queue::new(0);
+        assert_eq!(queue.workers.len(), 0);
+    }
+
+    #[test]
+    fn test_enqueue_adds_job_to_queue() {
+        let queue = Queue::new(0);
+        let job = make_job("job-1", "test payload");
+        queue.enqueue(job);
+
+        let (lock, _) = &*queue.jobs;
+        let jobs = lock.lock().unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, "job-1");
+    }
+
+    #[test]
+    fn test_enqueue_preserves_fifo_order() {
+        let queue = Queue::new(0);
+        queue.enqueue(make_job("job-1", "first"));
+        queue.enqueue(make_job("job-2", "second"));
+        queue.enqueue(make_job("job-3", "third"));
+
+        let (lock, _) = &*queue.jobs;
+        let jobs = lock.lock().unwrap();
+        assert_eq!(jobs.len(), 3);
+        assert_eq!(jobs[0].id, "job-1");
+        assert_eq!(jobs[1].id, "job-2");
+        assert_eq!(jobs[2].id, "job-3");
+    }
+
+    #[test]
+    fn test_wait_for_job_returns_front_job() {
+        let jobs = Arc::new((Mutex::new(VecDeque::new()), Condvar::new()));
+        {
+            let (lock, _) = &*jobs;
+            let mut q = lock.lock().unwrap();
+            q.push_back(make_job("job-1", "payload"));
+        }
+        let result = Queue::wait_for_job(&jobs);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().id, "job-1");
+    }
+
+    #[test]
+    fn test_process_job_updates_worker_status() {
+        let worker = Mutex::new(models::Worker {
+            id: "worker-0".to_string(),
+            status: models::WorkerStatus::Idle,
+            current_job_id: None,
+        });
+        let consumer = consumer::JobConsumer;
+        let job = make_job("job-1", "payload");
+
+        Queue::process_job(&worker, &consumer, job);
+
+        let w = worker.lock().unwrap();
+        assert!(matches!(w.status, models::WorkerStatus::Idle));
+        assert!(w.current_job_id.is_none());
+    }
+
+    #[test]
+    fn test_workers_consume_enqueued_jobs() {
+        let queue = Arc::new(Queue::new(2));
+        queue.start_workers();
+
+        queue.enqueue(make_job("job-1", "hello"));
+        queue.enqueue(make_job("job-2", "world"));
+
+        // Give workers time to process
+        thread::sleep(Duration::from_millis(100));
+
+        let (lock, _) = &*queue.jobs;
+        let jobs = lock.lock().unwrap();
+        assert_eq!(jobs.len(), 0);
+    }
+
+    #[test]
+    fn test_multiple_jobs_processed_concurrently() {
+        let queue = Arc::new(Queue::new(4));
+        queue.start_workers();
+
+        for i in 0..10 {
+            queue.enqueue(make_job(&format!("job-{}", i), &format!("payload-{}", i)));
+        }
+
+        thread::sleep(Duration::from_millis(200));
+
+        let (lock, _) = &*queue.jobs;
+        let jobs = lock.lock().unwrap();
+        assert_eq!(jobs.len(), 0);
     }
 }
