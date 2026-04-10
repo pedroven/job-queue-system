@@ -30,11 +30,14 @@ impl Queue {
         // because workers haven't started yet — when they first call wait_for_job,
         // the while-loop check finds the deque non-empty and proceeds immediately.
         let jobs_from_repo = job_repository.find_all_pending()?;
+        let dead_jobs_from_repo = job_repository.find_all_dead_letter()?;
         let jobs = Arc::new((Mutex::new(VecDeque::from(jobs_from_repo)), Condvar::new()));
+        let dead_letter_jobs = Arc::new(Mutex::new(VecDeque::from(dead_jobs_from_repo)));
+
         Ok(Queue {
             workers,
             jobs,
-            dead_letter_jobs: Arc::new(Mutex::new(VecDeque::new())),
+            dead_letter_jobs,
             job_repository,
         })
     }
@@ -80,9 +83,66 @@ impl Queue {
         jobs.pop_front()
     }
 
+    fn update_job_status(queue: &Arc<Queue>, job_id: &str, status: models::JobStatus) {
+        if let Err(e) = queue.job_repository.update_status(job_id, status) {
+            eprintln!("Failed to update job {job_id} status to {status}: {e}");
+        }
+    }
+
+    fn handle_job_tries(
+        queue: &Arc<Queue>,
+        consumer: &dyn Consumer,
+        mut job: models::Job,
+    ) -> Result<(), QueueError> {
+        let mut last_error = None;
+
+        for _ in 0..job.max_attempts {
+            match consumer.consume(&job) {
+                Ok(()) => {
+                    Self::update_job_status(queue, &job.id, models::JobStatus::Completed);
+                    return Ok(());
+                }
+                Err(e) => {
+                    job.retry_count += 1;
+                    last_error = Some(e.to_string());
+                    Self::update_job_status(queue, &job.id, models::JobStatus::Failed);
+                    if let Err(e) = queue
+                        .job_repository
+                        .update_retry_count(&job.id, job.retry_count)
+                    {
+                        eprintln!("Failed to update retry count for job {}: {e}", job.id);
+                    }
+                }
+            }
+        }
+
+        if let Some(error) = last_error {
+            Self::move_to_dead_letter(queue, job, error)?;
+        }
+        Ok(())
+    }
+
+    fn move_to_dead_letter(
+        queue: &Arc<Queue>,
+        job: models::Job,
+        error: String,
+    ) -> Result<(), QueueError> {
+        let dead_letter_job = models::DeadLetterJob {
+            id: format!("dl-{}", job.id),
+            original_job_id: job.id,
+            task: job.task.clone(),
+            error,
+            failed_at: std::time::SystemTime::now(),
+        };
+        queue.job_repository.save_dead_letter(&dead_letter_job)?;
+        let mut dl_jobs = queue.dead_letter_jobs.lock()?;
+        dl_jobs.push_back(dead_letter_job);
+        Ok(())
+    }
+
     fn process_job(
         worker: &Mutex<models::Worker>,
-        consumer: &consumer::JobConsumer,
+        consumer: &dyn Consumer,
         job: models::Job,
         queue: &Arc<Queue>,
     ) {
@@ -100,15 +160,8 @@ impl Queue {
             eprintln!("Failed to update job {job_id} to Running: {e}");
         }
 
-        let result = consumer.consume(job);
-
-        let final_status = if result.is_ok() {
-            models::JobStatus::Completed
-        } else {
-            models::JobStatus::Failed
-        };
-        if let Err(e) = queue.job_repository.update_status(&job_id, final_status) {
-            eprintln!("Failed to update job {job_id} status: {e}");
+        if let Err(e) = Self::handle_job_tries(queue, consumer, job) {
+            eprintln!("Failed to handle job tries: {e}");
         }
 
         {
@@ -122,6 +175,8 @@ impl Queue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::persistence::JobRepository;
+    use std::sync::Mutex as StdMutex;
     use std::time::Duration;
 
     use crate::queue::models::testing::make_test_job;
@@ -132,6 +187,34 @@ mod tests {
             Arc::new(crate::persistence::InMemoryJobRepository::new()),
         )
         .unwrap()
+    }
+
+    fn create_queue_with_repo(repo: Arc<dyn crate::persistence::JobRepository>) -> Arc<Queue> {
+        Arc::new(Queue::new(0, repo).unwrap())
+    }
+
+    struct FailNTimesConsumer {
+        remaining_failures: StdMutex<u32>,
+    }
+
+    impl FailNTimesConsumer {
+        fn new(failures: u32) -> Self {
+            Self {
+                remaining_failures: StdMutex::new(failures),
+            }
+        }
+    }
+
+    impl Consumer for FailNTimesConsumer {
+        fn consume(&self, _job: &models::Job) -> Result<(), QueueError> {
+            let mut remaining = self.remaining_failures.lock().unwrap();
+            if *remaining > 0 {
+                *remaining -= 1;
+                Err(QueueError::JobFailed("simulated failure".to_string()))
+            } else {
+                Ok(())
+            }
+        }
     }
 
     #[test]
@@ -248,5 +331,78 @@ mod tests {
         let (lock, _) = &*queue.jobs;
         let jobs = lock.lock().unwrap();
         assert_eq!(jobs.len(), 0);
+    }
+
+    #[test]
+    fn test_job_succeeds_on_first_attempt() {
+        let repo = Arc::new(crate::persistence::InMemoryJobRepository::new());
+        let queue = create_queue_with_repo(repo.clone());
+        let job = make_test_job("job-1", "payload");
+        repo.save(&job).unwrap();
+
+        let consumer = consumer::JobConsumer;
+        Queue::handle_job_tries(&queue, &consumer, job).unwrap();
+
+        let pending = repo.find_all_pending().unwrap();
+        assert_eq!(pending.len(), 0);
+
+        let dl = repo.find_all_dead_letter().unwrap();
+        assert_eq!(dl.len(), 0);
+    }
+
+    #[test]
+    fn test_job_succeeds_after_retries() {
+        let repo = Arc::new(crate::persistence::InMemoryJobRepository::new());
+        let queue = create_queue_with_repo(repo.clone());
+        let job = make_test_job("job-1", "payload");
+        repo.save(&job).unwrap();
+
+        let consumer = FailNTimesConsumer::new(2);
+        Queue::handle_job_tries(&queue, &consumer, job).unwrap();
+
+        let pending = repo.find_all_pending().unwrap();
+        assert_eq!(pending.len(), 0);
+
+        let dl = repo.find_all_dead_letter().unwrap();
+        assert_eq!(dl.len(), 0);
+    }
+
+    #[test]
+    fn test_job_exhausts_retries_moves_to_dlq() {
+        let repo = Arc::new(crate::persistence::InMemoryJobRepository::new());
+        let queue = create_queue_with_repo(repo.clone());
+        let job = make_test_job("job-1", "payload");
+        repo.save(&job).unwrap();
+
+        let consumer = FailNTimesConsumer::new(5);
+        Queue::handle_job_tries(&queue, &consumer, job).unwrap();
+
+        let dl = repo.find_all_dead_letter().unwrap();
+        assert_eq!(dl.len(), 1);
+        assert_eq!(dl[0].original_job_id, "job-1");
+        assert_eq!(dl[0].error, "job failed: simulated failure");
+
+        let persisted = repo.find_by_id("job-1").unwrap();
+        assert_eq!(persisted.retry_count, 3);
+        assert_eq!(persisted.status, models::JobStatus::Failed);
+    }
+
+    #[test]
+    fn test_retry_count_is_persisted() {
+        let repo = Arc::new(crate::persistence::InMemoryJobRepository::new());
+        let queue = create_queue_with_repo(repo.clone());
+        let job = make_test_job("job-1", "payload");
+        repo.save(&job).unwrap();
+
+        // Fail twice, succeed on 3rd attempt
+        let consumer = FailNTimesConsumer::new(2);
+        Queue::handle_job_tries(&queue, &consumer, job).unwrap();
+
+        let persisted = repo.find_by_id("job-1").unwrap();
+        assert_eq!(persisted.retry_count, 2);
+        assert_eq!(persisted.status, models::JobStatus::Completed);
+
+        let dl = repo.find_all_dead_letter().unwrap();
+        assert_eq!(dl.len(), 0);
     }
 }
