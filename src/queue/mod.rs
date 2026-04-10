@@ -1,4 +1,5 @@
 use crate::consumer::{self, Consumer};
+use crate::error::QueueError;
 use std::collections::VecDeque;
 use std::sync::{Condvar, Mutex};
 use std::{sync::Arc, thread};
@@ -9,10 +10,14 @@ pub struct Queue {
     workers: Vec<Arc<Mutex<models::Worker>>>,
     jobs: Arc<(Mutex<VecDeque<models::Job>>, Condvar)>,
     dead_letter_jobs: Arc<Mutex<VecDeque<models::DeadLetterJob>>>,
+    job_repository: Arc<dyn crate::persistence::JobRepository>,
 }
 
 impl Queue {
-    pub fn new(num_workers: usize) -> Self {
+    pub fn new(
+        num_workers: usize,
+        job_repository: Arc<dyn crate::persistence::JobRepository>,
+    ) -> Result<Self, QueueError> {
         let mut workers = Vec::new();
         for i in 0..num_workers {
             workers.push(Arc::new(Mutex::new(models::Worker {
@@ -21,36 +26,45 @@ impl Queue {
                 current_job_id: None,
             })));
         }
-        Queue {
+        // Restore pending jobs from the repository. No cvar notification is needed
+        // because workers haven't started yet — when they first call wait_for_job,
+        // the while-loop check finds the deque non-empty and proceeds immediately.
+        let jobs_from_repo = job_repository.find_all_pending()?;
+        let jobs = Arc::new((Mutex::new(VecDeque::from(jobs_from_repo)), Condvar::new()));
+        Ok(Queue {
             workers,
-            jobs: Arc::new((Mutex::new(VecDeque::new()), Condvar::new())),
+            jobs,
             dead_letter_jobs: Arc::new(Mutex::new(VecDeque::new())),
-        }
+            job_repository,
+        })
     }
 
     pub fn len(&self) -> usize {
         let (lock, _) = &*self.jobs;
-        let jobs = lock.lock().unwrap();
+        let jobs = lock.lock().unwrap_or_else(|e| e.into_inner());
         jobs.len()
     }
 
-    pub fn enqueue(&self, job: models::Job) {
+    pub fn enqueue(&self, job: models::Job) -> Result<(), QueueError> {
         let (lock, cvar) = &*self.jobs;
-        let mut jobs = lock.lock().unwrap();
+        self.job_repository.save(&job)?;
+        let mut jobs = lock.lock()?;
         jobs.push_back(job);
         cvar.notify_one();
+        Ok(())
     }
 
-    pub fn start_workers(&self) {
+    pub fn start_workers(self: &Arc<Self>) {
         for worker in &self.workers {
             let consumer = consumer::JobConsumer;
             let worker = Arc::clone(worker);
             let jobs = Arc::clone(&self.jobs);
+            let queue = Arc::clone(self);
             thread::spawn(move || {
                 loop {
                     let job = Self::wait_for_job(&jobs);
                     if let Some(job) = job {
-                        Self::process_job(&worker, &consumer, job);
+                        Self::process_job(&worker, &consumer, job, &queue);
                     }
                 }
             });
@@ -59,9 +73,9 @@ impl Queue {
 
     fn wait_for_job(jobs: &(Mutex<VecDeque<models::Job>>, Condvar)) -> Option<models::Job> {
         let (lock, cvar) = jobs;
-        let mut jobs = lock.lock().unwrap();
+        let mut jobs = lock.lock().unwrap_or_else(|e| e.into_inner());
         while jobs.is_empty() {
-            jobs = cvar.wait(jobs).unwrap();
+            jobs = cvar.wait(jobs).unwrap_or_else(|e| e.into_inner());
         }
         jobs.pop_front()
     }
@@ -70,15 +84,35 @@ impl Queue {
         worker: &Mutex<models::Worker>,
         consumer: &consumer::JobConsumer,
         job: models::Job,
+        queue: &Arc<Queue>,
     ) {
+        let job_id = job.id.clone();
         {
-            let mut w = worker.lock().unwrap();
+            let mut w = worker.lock().unwrap_or_else(|e| e.into_inner());
             w.status = models::WorkerStatus::Busy;
-            w.current_job_id = Some(job.id.clone());
+            w.current_job_id = Some(job_id.clone());
         }
-        consumer.consume(job).unwrap();
+
+        if let Err(e) = queue
+            .job_repository
+            .update_status(&job_id, models::JobStatus::Running)
         {
-            let mut w = worker.lock().unwrap();
+            eprintln!("Failed to update job {job_id} to Running: {e}");
+        }
+
+        let result = consumer.consume(job);
+
+        let final_status = if result.is_ok() {
+            models::JobStatus::Completed
+        } else {
+            models::JobStatus::Failed
+        };
+        if let Err(e) = queue.job_repository.update_status(&job_id, final_status) {
+            eprintln!("Failed to update job {job_id} status: {e}");
+        }
+
+        {
+            let mut w = worker.lock().unwrap_or_else(|e| e.into_inner());
             w.status = models::WorkerStatus::Idle;
             w.current_job_id = None;
         }
@@ -90,29 +124,25 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    fn make_job(id: &str, payload: &str) -> models::Job {
-        models::Job {
-            id: id.to_string(),
-            status: models::JobStatus::Pending,
-            retry_count: 0,
-            task: models::Task {
-                id: format!("task-{}", id),
-                payload: payload.to_string(),
-            },
-            max_retries: 3,
-            created_at: std::time::SystemTime::now(),
-        }
+    use crate::queue::models::testing::make_test_job;
+
+    fn create_queue(num_workers: usize) -> Queue {
+        Queue::new(
+            num_workers,
+            Arc::new(crate::persistence::InMemoryJobRepository::new()),
+        )
+        .unwrap()
     }
 
     #[test]
     fn test_queue_new_creates_correct_number_of_workers() {
-        let queue = Queue::new(4);
+        let queue = create_queue(4);
         assert_eq!(queue.workers.len(), 4);
     }
 
     #[test]
     fn test_queue_new_workers_start_idle() {
-        let queue = Queue::new(2);
+        let queue = create_queue(2);
         for worker in &queue.workers {
             let w = worker.lock().unwrap();
             assert!(matches!(w.status, models::WorkerStatus::Idle));
@@ -122,15 +152,15 @@ mod tests {
 
     #[test]
     fn test_queue_new_zero_workers() {
-        let queue = Queue::new(0);
+        let queue = create_queue(0);
         assert_eq!(queue.workers.len(), 0);
     }
 
     #[test]
     fn test_enqueue_adds_job_to_queue() {
-        let queue = Queue::new(0);
-        let job = make_job("job-1", "test payload");
-        queue.enqueue(job);
+        let queue = create_queue(0);
+        let job = make_test_job("job-1", "test payload");
+        queue.enqueue(job).unwrap();
 
         let (lock, _) = &*queue.jobs;
         let jobs = lock.lock().unwrap();
@@ -140,10 +170,10 @@ mod tests {
 
     #[test]
     fn test_enqueue_preserves_fifo_order() {
-        let queue = Queue::new(0);
-        queue.enqueue(make_job("job-1", "first"));
-        queue.enqueue(make_job("job-2", "second"));
-        queue.enqueue(make_job("job-3", "third"));
+        let queue = create_queue(0);
+        queue.enqueue(make_test_job("job-1", "first")).unwrap();
+        queue.enqueue(make_test_job("job-2", "second")).unwrap();
+        queue.enqueue(make_test_job("job-3", "third")).unwrap();
 
         let (lock, _) = &*queue.jobs;
         let jobs = lock.lock().unwrap();
@@ -159,7 +189,7 @@ mod tests {
         {
             let (lock, _) = &*jobs;
             let mut q = lock.lock().unwrap();
-            q.push_back(make_job("job-1", "payload"));
+            q.push_back(make_test_job("job-1", "payload"));
         }
         let result = Queue::wait_for_job(&jobs);
         assert!(result.is_some());
@@ -174,9 +204,9 @@ mod tests {
             current_job_id: None,
         });
         let consumer = consumer::JobConsumer;
-        let job = make_job("job-1", "payload");
+        let job = make_test_job("job-1", "payload");
 
-        Queue::process_job(&worker, &consumer, job);
+        Queue::process_job(&worker, &consumer, job, &Arc::new(create_queue(0)));
 
         let w = worker.lock().unwrap();
         assert!(matches!(w.status, models::WorkerStatus::Idle));
@@ -185,11 +215,11 @@ mod tests {
 
     #[test]
     fn test_workers_consume_enqueued_jobs() {
-        let queue = Arc::new(Queue::new(2));
+        let queue = Arc::new(create_queue(2));
         queue.start_workers();
 
-        queue.enqueue(make_job("job-1", "hello"));
-        queue.enqueue(make_job("job-2", "world"));
+        queue.enqueue(make_test_job("job-1", "hello")).unwrap();
+        queue.enqueue(make_test_job("job-2", "world")).unwrap();
 
         // Give workers time to process
         thread::sleep(Duration::from_millis(100));
@@ -201,11 +231,16 @@ mod tests {
 
     #[test]
     fn test_multiple_jobs_processed_concurrently() {
-        let queue = Arc::new(Queue::new(4));
+        let queue = Arc::new(create_queue(4));
         queue.start_workers();
 
         for i in 0..10 {
-            queue.enqueue(make_job(&format!("job-{}", i), &format!("payload-{}", i)));
+            queue
+                .enqueue(make_test_job(
+                    &format!("job-{}", i),
+                    &format!("payload-{}", i),
+                ))
+                .unwrap();
         }
 
         thread::sleep(Duration::from_millis(200));

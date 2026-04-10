@@ -1,13 +1,23 @@
 mod consumer;
+mod error;
+mod persistence;
 mod producer;
 mod queue;
 
 use producer::Producer;
+use queue::models::Job;
 use std::sync::Arc;
 
 fn main() {
+    let db_path = std::env::var("JOB_QUEUE_DB").unwrap_or_else(|_| "jobs.db".to_string());
+    let job_repository: Arc<dyn persistence::JobRepository> =
+        Arc::new(persistence::SqliteJobRepository::new(&db_path).expect("Failed to open database"));
+
     let num_workers = 4;
-    let queue = Arc::new(queue::Queue::new(num_workers));
+    let queue = Arc::new(
+        queue::Queue::new(num_workers, Arc::clone(&job_repository))
+            .expect("Failed to initialize queue"),
+    );
     queue.start_workers();
 
     let producer = producer::JobProducer::new(Arc::clone(&queue));
@@ -21,17 +31,7 @@ fn main() {
             .expect("Failed to read line");
 
         job_counter += 1;
-        let job = queue::models::Job {
-            id: format!("job-{}", job_counter),
-            task: queue::models::Task {
-                id: format!("task-{}", job_counter),
-                payload: payload.trim().to_string(),
-            },
-            status: queue::models::JobStatus::Pending,
-            retry_count: 0,
-            max_retries: 3,
-            created_at: std::time::SystemTime::now(),
-        };
+        let job = Job::new(format!("job-{job_counter}"), payload.trim().to_string());
         producer.produce(job).unwrap();
     }
 }
