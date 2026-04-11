@@ -11,6 +11,7 @@ pub struct Queue {
     jobs: Arc<(Mutex<VecDeque<models::Job>>, Condvar)>,
     dead_letter_jobs: Arc<Mutex<VecDeque<models::DeadLetterJob>>>,
     job_repository: Arc<dyn crate::persistence::JobRepository>,
+    backoff_base: std::time::Duration,
 }
 
 impl Queue {
@@ -39,6 +40,7 @@ impl Queue {
             jobs,
             dead_letter_jobs,
             job_repository,
+            backoff_base: std::time::Duration::from_secs(1),
         })
     }
 
@@ -83,35 +85,32 @@ impl Queue {
         jobs.pop_front()
     }
 
-    fn update_job_status(queue: &Arc<Queue>, job_id: &str, status: models::JobStatus) {
-        if let Err(e) = queue.job_repository.update_status(job_id, status) {
-            eprintln!("Failed to update job {job_id} status to {status}: {e}");
-        }
-    }
-
     fn handle_job_tries(
         queue: &Arc<Queue>,
         consumer: &dyn Consumer,
         mut job: models::Job,
+        backoff_base: std::time::Duration,
     ) -> Result<(), QueueError> {
         let mut last_error = None;
 
-        for _ in 0..job.max_attempts {
+        for attempt in 0..job.max_attempts {
             match consumer.consume(&job) {
                 Ok(()) => {
-                    Self::update_job_status(queue, &job.id, models::JobStatus::Completed);
+                    queue
+                        .job_repository
+                        .update_status(&job.id, models::JobStatus::Completed)?;
                     return Ok(());
                 }
                 Err(e) => {
                     job.retry_count += 1;
                     last_error = Some(e.to_string());
-                    Self::update_job_status(queue, &job.id, models::JobStatus::Failed);
-                    if let Err(e) = queue
+                    queue
                         .job_repository
-                        .update_retry_count(&job.id, job.retry_count)
-                    {
-                        eprintln!("Failed to update retry count for job {}: {e}", job.id);
-                    }
+                        .update_status(&job.id, models::JobStatus::Failed)?;
+                    queue
+                        .job_repository
+                        .update_retry_count(&job.id, job.retry_count)?;
+                    thread::sleep(backoff_base * (1 << (attempt + 1)));
                 }
             }
         }
@@ -160,7 +159,7 @@ impl Queue {
             eprintln!("Failed to update job {job_id} to Running: {e}");
         }
 
-        if let Err(e) = Self::handle_job_tries(queue, consumer, job) {
+        if let Err(e) = Self::handle_job_tries(queue, consumer, job, queue.backoff_base) {
             eprintln!("Failed to handle job tries: {e}");
         }
 
@@ -341,7 +340,7 @@ mod tests {
         repo.save(&job).unwrap();
 
         let consumer = consumer::JobConsumer;
-        Queue::handle_job_tries(&queue, &consumer, job).unwrap();
+        Queue::handle_job_tries(&queue, &consumer, job, Duration::ZERO).unwrap();
 
         let pending = repo.find_all_pending().unwrap();
         assert_eq!(pending.len(), 0);
@@ -358,7 +357,7 @@ mod tests {
         repo.save(&job).unwrap();
 
         let consumer = FailNTimesConsumer::new(2);
-        Queue::handle_job_tries(&queue, &consumer, job).unwrap();
+        Queue::handle_job_tries(&queue, &consumer, job, Duration::ZERO).unwrap();
 
         let pending = repo.find_all_pending().unwrap();
         assert_eq!(pending.len(), 0);
@@ -375,7 +374,7 @@ mod tests {
         repo.save(&job).unwrap();
 
         let consumer = FailNTimesConsumer::new(5);
-        Queue::handle_job_tries(&queue, &consumer, job).unwrap();
+        Queue::handle_job_tries(&queue, &consumer, job, Duration::ZERO).unwrap();
 
         let dl = repo.find_all_dead_letter().unwrap();
         assert_eq!(dl.len(), 1);
@@ -396,7 +395,7 @@ mod tests {
 
         // Fail twice, succeed on 3rd attempt
         let consumer = FailNTimesConsumer::new(2);
-        Queue::handle_job_tries(&queue, &consumer, job).unwrap();
+        Queue::handle_job_tries(&queue, &consumer, job, Duration::ZERO).unwrap();
 
         let persisted = repo.find_by_id("job-1").unwrap();
         assert_eq!(persisted.retry_count, 2);
