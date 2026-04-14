@@ -1,17 +1,17 @@
 use std::sync::Arc;
 
 use crate::error::QueueError;
-use crate::queue::models;
+use crate::models::Job;
 use crate::task::TaskRegistry;
 
 pub trait Consumer {
-    fn consume(&self, job: &models::Job) -> Result<(), QueueError>;
+    fn consume(&self, job: &Job) -> Result<(), QueueError>;
 }
 
 pub struct JobConsumer;
 
 impl Consumer for JobConsumer {
-    fn consume(&self, job: &models::Job) -> Result<(), QueueError> {
+    fn consume(&self, job: &Job) -> Result<(), QueueError> {
         println!("Consuming job: {:?}", job.id);
         println!("Consuming task: {:?}", job.task.id);
         println!("Payload: {:?}", job.task.payload);
@@ -30,7 +30,7 @@ impl RegistryConsumer {
 }
 
 impl Consumer for RegistryConsumer {
-    fn consume(&self, job: &models::Job) -> Result<(), QueueError> {
+    fn consume(&self, job: &Job) -> Result<(), QueueError> {
         let handler = self.registry.get(&job.task.name).ok_or_else(|| {
             QueueError::JobFailed(format!(
                 "no handler registered for task '{}'",
@@ -44,7 +44,7 @@ impl Consumer for RegistryConsumer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::queue::models::testing::make_test_job;
+    use crate::models::testing::make_test_job;
 
     #[test]
     fn test_consume_returns_ok() {
@@ -87,7 +87,7 @@ mod tests {
         let registry = TaskRegistry::new();
         let consumer = RegistryConsumer::new(Arc::new(registry));
 
-        let job = models::Job::with_task_name(
+        let job = Job::with_task_name(
             "job-1".to_string(),
             "nonexistent".to_string(),
             "payload".to_string(),
@@ -117,12 +117,12 @@ mod tests {
         registry.register("task_b", handler_b);
         let consumer = RegistryConsumer::new(Arc::new(registry));
 
-        let job_a = models::Job::with_task_name(
+        let job_a = Job::with_task_name(
             "j1".to_string(),
             "task_a".to_string(),
             "a-payload".to_string(),
         );
-        let job_b = models::Job::with_task_name(
+        let job_b = Job::with_task_name(
             "j2".to_string(),
             "task_b".to_string(),
             "b-payload".to_string(),

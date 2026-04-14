@@ -1,18 +1,10 @@
-use crate::error::QueueError;
-use crate::queue::models;
 use rusqlite::Connection;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-pub trait JobRepository: Send + Sync {
-    fn save(&self, job: &models::Job) -> Result<(), QueueError>;
-    fn save_dead_letter(&self, job: &models::DeadLetterJob) -> Result<(), QueueError>;
-    fn find_by_id(&self, job_id: &str) -> Result<models::Job, QueueError>;
-    fn find_all_pending(&self) -> Result<Vec<models::Job>, QueueError>;
-    fn find_all_dead_letter(&self) -> Result<Vec<models::DeadLetterJob>, QueueError>;
-    fn update_status(&self, job_id: &str, status: models::JobStatus) -> Result<(), QueueError>;
-    fn update_retry_count(&self, job_id: &str, retry_count: u32) -> Result<(), QueueError>;
-}
+use crate::error::QueueError;
+use crate::models::{DeadLetterJob, Job, JobStatus, TaskRecord};
+use crate::persistence::JobRepository;
 
 pub struct SqliteJobRepository {
     conn: Mutex<Connection>,
@@ -63,7 +55,7 @@ fn epoch_to_system_time(secs: u64) -> SystemTime {
 }
 
 impl JobRepository for SqliteJobRepository {
-    fn save(&self, job: &models::Job) -> Result<(), QueueError> {
+    fn save(&self, job: &Job) -> Result<(), QueueError> {
         let conn = self.conn.lock()?;
         conn.execute(
             "INSERT INTO jobs (id, status, retry_count, task_id, task_name, payload, max_attempts, created_at)
@@ -82,7 +74,7 @@ impl JobRepository for SqliteJobRepository {
         Ok(())
     }
 
-    fn find_by_id(&self, job_id: &str) -> Result<models::Job, QueueError> {
+    fn find_by_id(&self, job_id: &str) -> Result<Job, QueueError> {
         let conn = self.conn.lock()?;
         let mut stmt = conn.prepare(
             "SELECT id, status, retry_count, task_id, task_name, payload, max_attempts, created_at
@@ -106,11 +98,11 @@ impl JobRepository for SqliteJobRepository {
 
         let (id, status_str, retry_count, task_id, task_name, payload, max_attempts, created_at) =
             row;
-        Ok(models::Job {
+        Ok(Job {
             id,
             status: status_str.parse()?,
             retry_count,
-            task: models::Task {
+            task: TaskRecord {
                 id: task_id,
                 name: task_name,
                 payload,
@@ -120,7 +112,7 @@ impl JobRepository for SqliteJobRepository {
         })
     }
 
-    fn save_dead_letter(&self, job: &models::DeadLetterJob) -> Result<(), QueueError> {
+    fn save_dead_letter(&self, job: &DeadLetterJob) -> Result<(), QueueError> {
         let conn = self.conn.lock()?;
         conn.execute(
             "INSERT INTO dead_letter_jobs (id, original_job_id, task_id, task_name, payload, error, failed_at)
@@ -138,7 +130,7 @@ impl JobRepository for SqliteJobRepository {
         Ok(())
     }
 
-    fn find_all_pending(&self) -> Result<Vec<models::Job>, QueueError> {
+    fn find_all_pending(&self) -> Result<Vec<Job>, QueueError> {
         let conn = self.conn.lock()?;
         let mut stmt = conn.prepare(
             "SELECT id, status, retry_count, task_id, task_name, payload, max_attempts, created_at
@@ -164,11 +156,11 @@ impl JobRepository for SqliteJobRepository {
         for (id, status_str, retry_count, task_id, task_name, payload, max_attempts, created_at) in
             rows
         {
-            jobs.push(models::Job {
+            jobs.push(Job {
                 id,
                 status: status_str.parse()?,
                 retry_count,
-                task: models::Task {
+                task: TaskRecord {
                     id: task_id,
                     name: task_name,
                     payload,
@@ -181,7 +173,7 @@ impl JobRepository for SqliteJobRepository {
         Ok(jobs)
     }
 
-    fn find_all_dead_letter(&self) -> Result<Vec<models::DeadLetterJob>, QueueError> {
+    fn find_all_dead_letter(&self) -> Result<Vec<DeadLetterJob>, QueueError> {
         let conn = self.conn.lock()?;
         let mut stmt = conn.prepare(
             "SELECT id, original_job_id, task_id, task_name, payload, error, failed_at
@@ -204,10 +196,10 @@ impl JobRepository for SqliteJobRepository {
 
         let mut dl_jobs = Vec::with_capacity(rows.len());
         for (id, original_job_id, task_id, task_name, payload, error, failed_at) in rows {
-            dl_jobs.push(models::DeadLetterJob {
+            dl_jobs.push(DeadLetterJob {
                 id,
                 original_job_id,
-                task: models::Task {
+                task: TaskRecord {
                     id: task_id,
                     name: task_name,
                     payload,
@@ -220,7 +212,7 @@ impl JobRepository for SqliteJobRepository {
         Ok(dl_jobs)
     }
 
-    fn update_status(&self, job_id: &str, status: models::JobStatus) -> Result<(), QueueError> {
+    fn update_status(&self, job_id: &str, status: JobStatus) -> Result<(), QueueError> {
         let conn = self.conn.lock()?;
         let rows = conn.execute(
             "UPDATE jobs SET status = ?1 WHERE id = ?2",
@@ -247,114 +239,23 @@ impl JobRepository for SqliteJobRepository {
     }
 }
 
-#[derive(Default)]
-pub struct InMemoryJobRepository {
-    jobs: Mutex<Vec<models::Job>>,
-    dead_letter_jobs: Mutex<Vec<models::DeadLetterJob>>,
-}
-
-impl InMemoryJobRepository {
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
-
-impl JobRepository for InMemoryJobRepository {
-    fn save(&self, job: &models::Job) -> Result<(), QueueError> {
-        let mut jobs = self.jobs.lock()?;
-        if jobs.iter().any(|j| j.id == job.id) {
-            return Err(QueueError::AlreadyExists(job.id.clone()));
-        }
-        jobs.push(job.clone());
-        Ok(())
-    }
-
-    fn find_by_id(&self, job_id: &str) -> Result<models::Job, QueueError> {
-        let jobs = self.jobs.lock()?;
-        jobs.iter()
-            .find(|j| j.id == job_id)
-            .cloned()
-            .ok_or_else(|| QueueError::NotFound(job_id.to_string()))
-    }
-
-    fn save_dead_letter(&self, job: &models::DeadLetterJob) -> Result<(), QueueError> {
-        let mut dl_jobs = self.dead_letter_jobs.lock()?;
-        if dl_jobs.iter().any(|j| j.id == job.id) {
-            return Err(QueueError::AlreadyExists(job.id.clone()));
-        }
-        dl_jobs.push(job.clone());
-        Ok(())
-    }
-
-    fn find_all_pending(&self) -> Result<Vec<models::Job>, QueueError> {
-        let jobs = self.jobs.lock()?;
-        let pending = jobs
-            .iter()
-            .filter(|j| j.status == models::JobStatus::Pending)
-            .cloned()
-            .collect();
-        Ok(pending)
-    }
-
-    fn find_all_dead_letter(&self) -> Result<Vec<models::DeadLetterJob>, QueueError> {
-        let dl_jobs = self.dead_letter_jobs.lock()?;
-        Ok(dl_jobs.clone())
-    }
-
-    fn update_status(&self, job_id: &str, status: models::JobStatus) -> Result<(), QueueError> {
-        let mut jobs = self.jobs.lock()?;
-        let job = jobs
-            .iter_mut()
-            .find(|j| j.id == job_id)
-            .ok_or_else(|| QueueError::NotFound(job_id.to_string()))?;
-        job.status = status;
-        Ok(())
-    }
-
-    fn update_retry_count(&self, job_id: &str, retry_count: u32) -> Result<(), QueueError> {
-        let mut jobs = self.jobs.lock()?;
-        let job = jobs
-            .iter_mut()
-            .find(|j| j.id == job_id)
-            .ok_or_else(|| QueueError::NotFound(job_id.to_string()))?;
-        job.retry_count = retry_count;
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::queue::models::testing::make_test_job;
+    use crate::models::testing::make_test_job;
 
-    #[test]
-    fn test_in_memory_save_and_find_pending() {
-        let repo = InMemoryJobRepository::new();
-        repo.save(&make_test_job("job-1", "payload-1")).unwrap();
-        repo.save(&make_test_job("job-2", "payload-2")).unwrap();
-
-        let pending = repo.find_all_pending().unwrap();
-        assert_eq!(pending.len(), 2);
-        assert_eq!(pending[0].id, "job-1");
-        assert_eq!(pending[1].id, "job-2");
-    }
-
-    #[test]
-    fn test_in_memory_update_status_excludes_from_pending() {
-        let repo = InMemoryJobRepository::new();
-        repo.save(&make_test_job("job-1", "payload")).unwrap();
-        repo.update_status("job-1", models::JobStatus::Completed)
-            .unwrap();
-
-        let pending = repo.find_all_pending().unwrap();
-        assert_eq!(pending.len(), 0);
-    }
-
-    #[test]
-    fn test_in_memory_update_status_not_found() {
-        let repo = InMemoryJobRepository::new();
-        let result = repo.update_status("nonexistent", models::JobStatus::Running);
-        assert!(result.is_err());
+    fn make_dead_letter_job(id: &str, original_job_id: &str) -> DeadLetterJob {
+        DeadLetterJob {
+            id: id.to_string(),
+            original_job_id: original_job_id.to_string(),
+            task: TaskRecord {
+                id: format!("task-{original_job_id}"),
+                name: "default".to_string(),
+                payload: "payload".to_string(),
+            },
+            error: "something went wrong".to_string(),
+            failed_at: SystemTime::now(),
+        }
     }
 
     #[test]
@@ -376,8 +277,7 @@ mod tests {
         let repo = SqliteJobRepository::new(":memory:").unwrap();
         repo.save(&make_test_job("job-1", "payload")).unwrap();
 
-        repo.update_status("job-1", models::JobStatus::Running)
-            .unwrap();
+        repo.update_status("job-1", JobStatus::Running).unwrap();
         let pending = repo.find_all_pending().unwrap();
         assert_eq!(pending.len(), 0);
     }
@@ -385,7 +285,7 @@ mod tests {
     #[test]
     fn test_sqlite_update_status_not_found() {
         let repo = SqliteJobRepository::new(":memory:").unwrap();
-        let result = repo.update_status("nonexistent", models::JobStatus::Running);
+        let result = repo.update_status("nonexistent", JobStatus::Running);
         assert!(result.is_err());
     }
 
@@ -394,10 +294,8 @@ mod tests {
         let repo = SqliteJobRepository::new(":memory:").unwrap();
         repo.save(&make_test_job("job-1", "payload")).unwrap();
 
-        repo.update_status("job-1", models::JobStatus::Running)
-            .unwrap();
-        repo.update_status("job-1", models::JobStatus::Completed)
-            .unwrap();
+        repo.update_status("job-1", JobStatus::Running).unwrap();
+        repo.update_status("job-1", JobStatus::Completed).unwrap();
 
         let pending = repo.find_all_pending().unwrap();
         assert_eq!(pending.len(), 0);
@@ -410,42 +308,12 @@ mod tests {
         repo.save(&make_test_job("job-2", "p2")).unwrap();
         repo.save(&make_test_job("job-3", "p3")).unwrap();
 
-        repo.update_status("job-1", models::JobStatus::Completed)
-            .unwrap();
-        repo.update_status("job-2", models::JobStatus::Failed)
-            .unwrap();
+        repo.update_status("job-1", JobStatus::Completed).unwrap();
+        repo.update_status("job-2", JobStatus::Failed).unwrap();
 
         let pending = repo.find_all_pending().unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].id, "job-3");
-    }
-
-    fn make_dead_letter_job(id: &str, original_job_id: &str) -> models::DeadLetterJob {
-        models::DeadLetterJob {
-            id: id.to_string(),
-            original_job_id: original_job_id.to_string(),
-            task: models::Task {
-                id: format!("task-{original_job_id}"),
-                name: "default".to_string(),
-                payload: "payload".to_string(),
-            },
-            error: "something went wrong".to_string(),
-            failed_at: std::time::SystemTime::now(),
-        }
-    }
-
-    #[test]
-    fn test_in_memory_save_and_find_dead_letter() {
-        let repo = InMemoryJobRepository::new();
-        repo.save_dead_letter(&make_dead_letter_job("dl-1", "job-1"))
-            .unwrap();
-        repo.save_dead_letter(&make_dead_letter_job("dl-2", "job-2"))
-            .unwrap();
-
-        let dl = repo.find_all_dead_letter().unwrap();
-        assert_eq!(dl.len(), 2);
-        assert_eq!(dl[0].original_job_id, "job-1");
-        assert_eq!(dl[1].original_job_id, "job-2");
     }
 
     #[test]
@@ -464,23 +332,6 @@ mod tests {
     }
 
     #[test]
-    fn test_in_memory_find_by_id() {
-        let repo = InMemoryJobRepository::new();
-        repo.save(&make_test_job("job-1", "payload-1")).unwrap();
-
-        let job = repo.find_by_id("job-1").unwrap();
-        assert_eq!(job.id, "job-1");
-        assert_eq!(job.task.payload, "payload-1");
-    }
-
-    #[test]
-    fn test_in_memory_find_by_id_not_found() {
-        let repo = InMemoryJobRepository::new();
-        let result = repo.find_by_id("nonexistent");
-        assert!(result.is_err());
-    }
-
-    #[test]
     fn test_sqlite_find_by_id() {
         let repo = SqliteJobRepository::new(":memory:").unwrap();
         repo.save(&make_test_job("job-1", "payload-1")).unwrap();
@@ -494,23 +345,6 @@ mod tests {
     fn test_sqlite_find_by_id_not_found() {
         let repo = SqliteJobRepository::new(":memory:").unwrap();
         let result = repo.find_by_id("nonexistent");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_in_memory_update_retry_count() {
-        let repo = InMemoryJobRepository::new();
-        repo.save(&make_test_job("job-1", "payload")).unwrap();
-
-        repo.update_retry_count("job-1", 3).unwrap();
-        let job = repo.find_by_id("job-1").unwrap();
-        assert_eq!(job.retry_count, 3);
-    }
-
-    #[test]
-    fn test_in_memory_update_retry_count_not_found() {
-        let repo = InMemoryJobRepository::new();
-        let result = repo.update_retry_count("nonexistent", 1);
         assert!(result.is_err());
     }
 
@@ -534,7 +368,7 @@ mod tests {
     #[test]
     fn test_sqlite_preserves_task_name() {
         let repo = SqliteJobRepository::new(":memory:").unwrap();
-        let job = models::Job::with_task_name(
+        let job = Job::with_task_name(
             "job-1".to_string(),
             "send_email".to_string(),
             "user@example.com".to_string(),
@@ -549,7 +383,7 @@ mod tests {
     #[test]
     fn test_sqlite_find_all_pending_preserves_task_name() {
         let repo = SqliteJobRepository::new(":memory:").unwrap();
-        let job = models::Job::with_task_name(
+        let job = Job::with_task_name(
             "job-1".to_string(),
             "process_image".to_string(),
             "img.png".to_string(),

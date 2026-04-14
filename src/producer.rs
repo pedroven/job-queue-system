@@ -1,17 +1,19 @@
-use crate::error::QueueError;
-use crate::queue::{self, models::Job};
 use std::sync::Arc;
+
+use crate::error::QueueError;
+use crate::models::Job;
+use crate::queue::Queue;
 
 pub trait Producer {
     fn produce(&self, job: Job) -> Result<(), QueueError>;
 }
 
 pub struct JobProducer {
-    queue: Arc<queue::Queue>,
+    queue: Arc<Queue>,
 }
 
 impl JobProducer {
-    pub fn new(queue: Arc<queue::Queue>) -> Self {
+    pub fn new(queue: Arc<Queue>) -> Self {
         JobProducer { queue }
     }
 }
@@ -25,13 +27,15 @@ impl Producer for JobProducer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::queue::models::testing::make_test_job;
+    use crate::models::testing::make_test_job;
+    use crate::persistence::InMemoryJobRepository;
+    use crate::task::TaskRegistry;
 
-    fn create_queue(num_workers: usize) -> queue::Queue {
-        queue::Queue::new(
+    fn create_queue(num_workers: usize) -> Queue {
+        Queue::new(
             num_workers,
-            Arc::new(crate::persistence::InMemoryJobRepository::new()),
-            crate::task::TaskRegistry::new(),
+            Arc::new(InMemoryJobRepository::new()),
+            TaskRegistry::new(),
         )
         .unwrap()
     }

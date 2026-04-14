@@ -47,7 +47,7 @@ pub struct Job {
     pub id: String,
     pub status: JobStatus,
     pub retry_count: u32,
-    pub task: Task,
+    pub task: TaskRecord,
     pub max_attempts: u32,
     pub created_at: SystemTime,
 }
@@ -55,7 +55,7 @@ pub struct Job {
 impl Job {
     pub fn with_task_name(id: String, task_name: String, payload: String) -> Self {
         Job {
-            task: Task {
+            task: TaskRecord {
                 id: format!("task-{id}"),
                 name: task_name,
                 payload,
@@ -73,13 +73,13 @@ impl Job {
 pub struct DeadLetterJob {
     pub id: String,
     pub original_job_id: String,
-    pub task: Task,
+    pub task: TaskRecord,
     pub error: String,
     pub failed_at: SystemTime,
 }
 
 #[derive(Debug, Clone)]
-pub struct Task {
+pub struct TaskRecord {
     pub id: String,
     pub name: String,
     pub payload: String,

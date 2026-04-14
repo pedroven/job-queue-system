@@ -6,7 +6,7 @@ use serde::de::DeserializeOwned;
 use uuid::Uuid;
 
 use crate::error::QueueError;
-use crate::queue::models::Job;
+use crate::models::Job;
 
 pub type TaskHandler = fn(&str) -> Result<(), QueueError>;
 

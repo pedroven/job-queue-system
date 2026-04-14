@@ -1,33 +1,34 @@
-#[allow(unused_imports)]
-use crate::consumer::{self, Consumer, RegistryConsumer};
+use crate::consumer::RegistryConsumer;
 use crate::error::QueueError;
-use crate::task::TaskRegistry;
+use crate::models::{DeadLetterJob, Job, Worker, WorkerStatus};
+use crate::persistence::JobRepository;
+use crate::task::{TaskRegistry, generate_job_id};
 use std::collections::VecDeque;
-use std::sync::{Condvar, Mutex};
-use std::{sync::Arc, thread};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
 
-pub mod models;
+mod worker;
 
 pub struct Queue {
-    workers: Vec<Arc<Mutex<models::Worker>>>,
-    jobs: Arc<(Mutex<VecDeque<models::Job>>, Condvar)>,
-    dead_letter_jobs: Arc<Mutex<VecDeque<models::DeadLetterJob>>>,
-    job_repository: Arc<dyn crate::persistence::JobRepository>,
-    registry: Arc<TaskRegistry>,
-    backoff_base: std::time::Duration,
+    pub(crate) workers: Vec<Arc<Mutex<Worker>>>,
+    pub(crate) jobs: Arc<(Mutex<VecDeque<Job>>, Condvar)>,
+    pub(crate) dead_letter_jobs: Arc<Mutex<VecDeque<DeadLetterJob>>>,
+    pub(crate) job_repository: Arc<dyn JobRepository>,
+    pub(crate) registry: Arc<TaskRegistry>,
+    pub(crate) backoff_base: std::time::Duration,
 }
 
 impl Queue {
     pub fn new(
         num_workers: usize,
-        job_repository: Arc<dyn crate::persistence::JobRepository>,
+        job_repository: Arc<dyn JobRepository>,
         registry: TaskRegistry,
     ) -> Result<Self, QueueError> {
         let mut workers = Vec::new();
         for i in 0..num_workers {
-            workers.push(Arc::new(Mutex::new(models::Worker {
+            workers.push(Arc::new(Mutex::new(Worker {
                 id: format!("worker-{}", i),
-                status: models::WorkerStatus::Idle,
+                status: WorkerStatus::Idle,
                 current_job_id: None,
             })));
         }
@@ -55,6 +56,10 @@ impl Queue {
         jobs.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn enqueue_by_name<P: serde::Serialize>(
         &self,
         task_name: &str,
@@ -67,12 +72,12 @@ impl Queue {
         }
         let json = serde_json::to_string(&payload)
             .map_err(|e| QueueError::JobFailed(format!("serialize {task_name}: {e}")))?;
-        let job_id = crate::task::generate_job_id();
-        let job = models::Job::with_task_name(job_id, task_name.to_string(), json);
+        let job_id = generate_job_id();
+        let job = Job::with_task_name(job_id, task_name.to_string(), json);
         self.enqueue(job)
     }
 
-    pub fn enqueue(&self, job: models::Job) -> Result<(), QueueError> {
+    pub fn enqueue(&self, job: Job) -> Result<(), QueueError> {
         let (lock, cvar) = &*self.jobs;
         self.job_repository.save(&job)?;
         let mut jobs = lock.lock()?;
@@ -91,14 +96,14 @@ impl Queue {
                 loop {
                     let job = Self::wait_for_job(&jobs);
                     if let Some(job) = job {
-                        Self::process_job(&worker, &consumer, job, &queue);
+                        worker::process_job(&worker, &consumer, job, &queue);
                     }
                 }
             });
         }
     }
 
-    fn wait_for_job(jobs: &(Mutex<VecDeque<models::Job>>, Condvar)) -> Option<models::Job> {
+    pub(crate) fn wait_for_job(jobs: &(Mutex<VecDeque<Job>>, Condvar)) -> Option<Job> {
         let (lock, cvar) = jobs;
         let mut jobs = lock.lock().unwrap_or_else(|e| e.into_inner());
         while jobs.is_empty() {
@@ -106,101 +111,16 @@ impl Queue {
         }
         jobs.pop_front()
     }
-
-    fn handle_job_tries(
-        queue: &Arc<Queue>,
-        consumer: &dyn Consumer,
-        mut job: models::Job,
-        backoff_base: std::time::Duration,
-    ) -> Result<(), QueueError> {
-        let mut last_error = None;
-
-        for attempt in 0..job.max_attempts {
-            match consumer.consume(&job) {
-                Ok(()) => {
-                    queue
-                        .job_repository
-                        .update_status(&job.id, models::JobStatus::Completed)?;
-                    return Ok(());
-                }
-                Err(e) => {
-                    job.retry_count += 1;
-                    last_error = Some(e.to_string());
-                    queue
-                        .job_repository
-                        .update_status(&job.id, models::JobStatus::Failed)?;
-                    queue
-                        .job_repository
-                        .update_retry_count(&job.id, job.retry_count)?;
-                    thread::sleep(backoff_base * (1 << (attempt + 1)));
-                }
-            }
-        }
-
-        if let Some(error) = last_error {
-            Self::move_to_dead_letter(queue, job, error)?;
-        }
-        Ok(())
-    }
-
-    fn move_to_dead_letter(
-        queue: &Arc<Queue>,
-        job: models::Job,
-        error: String,
-    ) -> Result<(), QueueError> {
-        let dead_letter_job = models::DeadLetterJob {
-            id: format!("dl-{}", job.id),
-            original_job_id: job.id,
-            task: job.task.clone(),
-            error,
-            failed_at: std::time::SystemTime::now(),
-        };
-        queue.job_repository.save_dead_letter(&dead_letter_job)?;
-        let mut dl_jobs = queue.dead_letter_jobs.lock()?;
-        dl_jobs.push_back(dead_letter_job);
-        Ok(())
-    }
-
-    fn process_job(
-        worker: &Mutex<models::Worker>,
-        consumer: &dyn Consumer,
-        job: models::Job,
-        queue: &Arc<Queue>,
-    ) {
-        let job_id = job.id.clone();
-        {
-            let mut w = worker.lock().unwrap_or_else(|e| e.into_inner());
-            w.status = models::WorkerStatus::Busy;
-            w.current_job_id = Some(job_id.clone());
-        }
-
-        if let Err(e) = queue
-            .job_repository
-            .update_status(&job_id, models::JobStatus::Running)
-        {
-            eprintln!("Failed to update job {job_id} to Running: {e}");
-        }
-
-        if let Err(e) = Self::handle_job_tries(queue, consumer, job, queue.backoff_base) {
-            eprintln!("Failed to handle job tries: {e}");
-        }
-
-        {
-            let mut w = worker.lock().unwrap_or_else(|e| e.into_inner());
-            w.status = models::WorkerStatus::Idle;
-            w.current_job_id = None;
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::persistence::JobRepository;
+    use crate::consumer::{self, Consumer};
+    use crate::models::{self, testing::make_test_job};
+    use crate::persistence::{InMemoryJobRepository, JobRepository};
     use std::sync::Mutex as StdMutex;
     use std::time::Duration;
-
-    use crate::queue::models::testing::make_test_job;
 
     fn default_registry() -> TaskRegistry {
         let mut registry = TaskRegistry::new();
@@ -211,13 +131,13 @@ mod tests {
     fn create_queue(num_workers: usize) -> Queue {
         Queue::new(
             num_workers,
-            Arc::new(crate::persistence::InMemoryJobRepository::new()),
+            Arc::new(InMemoryJobRepository::new()),
             default_registry(),
         )
         .unwrap()
     }
 
-    fn create_queue_with_repo(repo: Arc<dyn crate::persistence::JobRepository>) -> Arc<Queue> {
+    fn create_queue_with_repo(repo: Arc<dyn JobRepository>) -> Arc<Queue> {
         Arc::new(Queue::new(0, repo, default_registry()).unwrap())
     }
 
@@ -234,7 +154,7 @@ mod tests {
     }
 
     impl Consumer for FailNTimesConsumer {
-        fn consume(&self, _job: &models::Job) -> Result<(), QueueError> {
+        fn consume(&self, _job: &Job) -> Result<(), QueueError> {
             let mut remaining = self.remaining_failures.lock().unwrap();
             if *remaining > 0 {
                 *remaining -= 1;
@@ -256,7 +176,7 @@ mod tests {
         let queue = create_queue(2);
         for worker in &queue.workers {
             let w = worker.lock().unwrap();
-            assert!(matches!(w.status, models::WorkerStatus::Idle));
+            assert!(matches!(w.status, WorkerStatus::Idle));
             assert!(w.current_job_id.is_none());
         }
     }
@@ -309,18 +229,18 @@ mod tests {
 
     #[test]
     fn test_process_job_updates_worker_status() {
-        let worker = Mutex::new(models::Worker {
+        let worker = Mutex::new(Worker {
             id: "worker-0".to_string(),
-            status: models::WorkerStatus::Idle,
+            status: WorkerStatus::Idle,
             current_job_id: None,
         });
         let consumer = consumer::JobConsumer;
         let job = make_test_job("job-1", "payload");
 
-        Queue::process_job(&worker, &consumer, job, &Arc::new(create_queue(0)));
+        worker::process_job(&worker, &consumer, job, &Arc::new(create_queue(0)));
 
         let w = worker.lock().unwrap();
-        assert!(matches!(w.status, models::WorkerStatus::Idle));
+        assert!(matches!(w.status, WorkerStatus::Idle));
         assert!(w.current_job_id.is_none());
     }
 
@@ -332,7 +252,6 @@ mod tests {
         queue.enqueue(make_test_job("job-1", "hello")).unwrap();
         queue.enqueue(make_test_job("job-2", "world")).unwrap();
 
-        // Give workers time to process
         thread::sleep(Duration::from_millis(100));
 
         let (lock, _) = &*queue.jobs;
@@ -363,13 +282,13 @@ mod tests {
 
     #[test]
     fn test_job_succeeds_on_first_attempt() {
-        let repo = Arc::new(crate::persistence::InMemoryJobRepository::new());
+        let repo = Arc::new(InMemoryJobRepository::new());
         let queue = create_queue_with_repo(repo.clone());
         let job = make_test_job("job-1", "payload");
         repo.save(&job).unwrap();
 
         let consumer = consumer::JobConsumer;
-        Queue::handle_job_tries(&queue, &consumer, job, Duration::ZERO).unwrap();
+        worker::handle_job_tries(&queue, &consumer, job, Duration::ZERO).unwrap();
 
         let pending = repo.find_all_pending().unwrap();
         assert_eq!(pending.len(), 0);
@@ -380,13 +299,13 @@ mod tests {
 
     #[test]
     fn test_job_succeeds_after_retries() {
-        let repo = Arc::new(crate::persistence::InMemoryJobRepository::new());
+        let repo = Arc::new(InMemoryJobRepository::new());
         let queue = create_queue_with_repo(repo.clone());
         let job = make_test_job("job-1", "payload");
         repo.save(&job).unwrap();
 
         let consumer = FailNTimesConsumer::new(2);
-        Queue::handle_job_tries(&queue, &consumer, job, Duration::ZERO).unwrap();
+        worker::handle_job_tries(&queue, &consumer, job, Duration::ZERO).unwrap();
 
         let pending = repo.find_all_pending().unwrap();
         assert_eq!(pending.len(), 0);
@@ -397,13 +316,13 @@ mod tests {
 
     #[test]
     fn test_job_exhausts_retries_moves_to_dlq() {
-        let repo = Arc::new(crate::persistence::InMemoryJobRepository::new());
+        let repo = Arc::new(InMemoryJobRepository::new());
         let queue = create_queue_with_repo(repo.clone());
         let job = make_test_job("job-1", "payload");
         repo.save(&job).unwrap();
 
         let consumer = FailNTimesConsumer::new(5);
-        Queue::handle_job_tries(&queue, &consumer, job, Duration::ZERO).unwrap();
+        worker::handle_job_tries(&queue, &consumer, job, Duration::ZERO).unwrap();
 
         let dl = repo.find_all_dead_letter().unwrap();
         assert_eq!(dl.len(), 1);
@@ -417,14 +336,13 @@ mod tests {
 
     #[test]
     fn test_retry_count_is_persisted() {
-        let repo = Arc::new(crate::persistence::InMemoryJobRepository::new());
+        let repo = Arc::new(InMemoryJobRepository::new());
         let queue = create_queue_with_repo(repo.clone());
         let job = make_test_job("job-1", "payload");
         repo.save(&job).unwrap();
 
-        // Fail twice, succeed on 3rd attempt
         let consumer = FailNTimesConsumer::new(2);
-        Queue::handle_job_tries(&queue, &consumer, job, Duration::ZERO).unwrap();
+        worker::handle_job_tries(&queue, &consumer, job, Duration::ZERO).unwrap();
 
         let persisted = repo.find_by_id("job-1").unwrap();
         assert_eq!(persisted.retry_count, 2);
