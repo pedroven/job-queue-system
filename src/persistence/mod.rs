@@ -27,6 +27,7 @@ impl SqliteJobRepository {
                 status TEXT NOT NULL,
                 retry_count INTEGER NOT NULL,
                 task_id TEXT NOT NULL,
+                task_name TEXT NOT NULL DEFAULT 'default',
                 payload TEXT NOT NULL,
                 max_attempts INTEGER NOT NULL,
                 created_at INTEGER NOT NULL
@@ -38,6 +39,7 @@ impl SqliteJobRepository {
                 id TEXT PRIMARY KEY,
                 original_job_id TEXT NOT NULL,
                 task_id TEXT NOT NULL,
+                task_name TEXT NOT NULL DEFAULT 'default',
                 payload TEXT NOT NULL,
                 error TEXT NOT NULL,
                 failed_at INTEGER NOT NULL
@@ -64,13 +66,14 @@ impl JobRepository for SqliteJobRepository {
     fn save(&self, job: &models::Job) -> Result<(), QueueError> {
         let conn = self.conn.lock()?;
         conn.execute(
-            "INSERT INTO jobs (id, status, retry_count, task_id, payload, max_attempts, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO jobs (id, status, retry_count, task_id, task_name, payload, max_attempts, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             (
                 &job.id,
                 job.status.as_str(),
                 job.retry_count,
                 &job.task.id,
+                &job.task.name,
                 &job.task.payload,
                 job.max_attempts,
                 system_time_to_epoch(job.created_at),
@@ -82,7 +85,7 @@ impl JobRepository for SqliteJobRepository {
     fn find_by_id(&self, job_id: &str) -> Result<models::Job, QueueError> {
         let conn = self.conn.lock()?;
         let mut stmt = conn.prepare(
-            "SELECT id, status, retry_count, task_id, payload, max_attempts, created_at
+            "SELECT id, status, retry_count, task_id, task_name, payload, max_attempts, created_at
              FROM jobs WHERE id = ?1",
         )?;
 
@@ -94,19 +97,22 @@ impl JobRepository for SqliteJobRepository {
                     row.get::<_, u32>(2)?,
                     row.get::<_, String>(3)?,
                     row.get::<_, String>(4)?,
-                    row.get::<_, u32>(5)?,
-                    row.get::<_, u64>(6)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, u32>(6)?,
+                    row.get::<_, u64>(7)?,
                 ))
             })
             .map_err(|_| QueueError::NotFound(job_id.to_string()))?;
 
-        let (id, status_str, retry_count, task_id, payload, max_attempts, created_at) = row;
+        let (id, status_str, retry_count, task_id, task_name, payload, max_attempts, created_at) =
+            row;
         Ok(models::Job {
             id,
             status: status_str.parse()?,
             retry_count,
             task: models::Task {
                 id: task_id,
+                name: task_name,
                 payload,
             },
             max_attempts,
@@ -117,12 +123,13 @@ impl JobRepository for SqliteJobRepository {
     fn save_dead_letter(&self, job: &models::DeadLetterJob) -> Result<(), QueueError> {
         let conn = self.conn.lock()?;
         conn.execute(
-            "INSERT INTO dead_letter_jobs (id, original_job_id, task_id, payload, error, failed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO dead_letter_jobs (id, original_job_id, task_id, task_name, payload, error, failed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             (
                 &job.id,
                 &job.original_job_id,
                 &job.task.id,
+                &job.task.name,
                 &job.task.payload,
                 &job.error,
                 system_time_to_epoch(job.failed_at),
@@ -134,7 +141,7 @@ impl JobRepository for SqliteJobRepository {
     fn find_all_pending(&self) -> Result<Vec<models::Job>, QueueError> {
         let conn = self.conn.lock()?;
         let mut stmt = conn.prepare(
-            "SELECT id, status, retry_count, task_id, payload, max_attempts, created_at
+            "SELECT id, status, retry_count, task_id, task_name, payload, max_attempts, created_at
              FROM jobs WHERE status = 'pending' ORDER BY created_at ASC",
         )?;
 
@@ -146,20 +153,24 @@ impl JobRepository for SqliteJobRepository {
                     row.get::<_, u32>(2)?,
                     row.get::<_, String>(3)?,
                     row.get::<_, String>(4)?,
-                    row.get::<_, u32>(5)?,
-                    row.get::<_, u64>(6)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, u32>(6)?,
+                    row.get::<_, u64>(7)?,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
 
         let mut jobs = Vec::with_capacity(rows.len());
-        for (id, status_str, retry_count, task_id, payload, max_attempts, created_at) in rows {
+        for (id, status_str, retry_count, task_id, task_name, payload, max_attempts, created_at) in
+            rows
+        {
             jobs.push(models::Job {
                 id,
                 status: status_str.parse()?,
                 retry_count,
                 task: models::Task {
                     id: task_id,
+                    name: task_name,
                     payload,
                 },
                 max_attempts,
@@ -173,7 +184,7 @@ impl JobRepository for SqliteJobRepository {
     fn find_all_dead_letter(&self) -> Result<Vec<models::DeadLetterJob>, QueueError> {
         let conn = self.conn.lock()?;
         let mut stmt = conn.prepare(
-            "SELECT id, original_job_id, task_id, payload, error, failed_at
+            "SELECT id, original_job_id, task_id, task_name, payload, error, failed_at
              FROM dead_letter_jobs ORDER BY failed_at ASC",
         )?;
 
@@ -185,18 +196,20 @@ impl JobRepository for SqliteJobRepository {
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
                     row.get::<_, String>(4)?,
-                    row.get::<_, u64>(5)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, u64>(6)?,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
 
         let mut dl_jobs = Vec::with_capacity(rows.len());
-        for (id, original_job_id, task_id, payload, error, failed_at) in rows {
+        for (id, original_job_id, task_id, task_name, payload, error, failed_at) in rows {
             dl_jobs.push(models::DeadLetterJob {
                 id,
                 original_job_id,
                 task: models::Task {
                     id: task_id,
+                    name: task_name,
                     payload,
                 },
                 error,
@@ -413,6 +426,7 @@ mod tests {
             original_job_id: original_job_id.to_string(),
             task: models::Task {
                 id: format!("task-{original_job_id}"),
+                name: "default".to_string(),
                 payload: "payload".to_string(),
             },
             error: "something went wrong".to_string(),
@@ -515,5 +529,35 @@ mod tests {
         let repo = SqliteJobRepository::new(":memory:").unwrap();
         let result = repo.update_retry_count("nonexistent", 1);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_sqlite_preserves_task_name() {
+        let repo = SqliteJobRepository::new(":memory:").unwrap();
+        let job = models::Job::with_task_name(
+            "job-1".to_string(),
+            "send_email".to_string(),
+            "user@example.com".to_string(),
+        );
+        repo.save(&job).unwrap();
+
+        let loaded = repo.find_by_id("job-1").unwrap();
+        assert_eq!(loaded.task.name, "send_email");
+        assert_eq!(loaded.task.payload, "user@example.com");
+    }
+
+    #[test]
+    fn test_sqlite_find_all_pending_preserves_task_name() {
+        let repo = SqliteJobRepository::new(":memory:").unwrap();
+        let job = models::Job::with_task_name(
+            "job-1".to_string(),
+            "process_image".to_string(),
+            "img.png".to_string(),
+        );
+        repo.save(&job).unwrap();
+
+        let pending = repo.find_all_pending().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].task.name, "process_image");
     }
 }
