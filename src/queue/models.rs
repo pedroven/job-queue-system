@@ -53,10 +53,11 @@ pub struct Job {
 }
 
 impl Job {
-    pub fn new(id: String, payload: String) -> Self {
+    pub fn with_task_name(id: String, task_name: String, payload: String) -> Self {
         Job {
             task: Task {
                 id: format!("task-{id}"),
+                name: task_name,
                 payload,
             },
             id,
@@ -80,6 +81,7 @@ pub struct DeadLetterJob {
 #[derive(Debug, Clone)]
 pub struct Task {
     pub id: String,
+    pub name: String,
     pub payload: String,
 }
 
@@ -102,6 +104,23 @@ pub(crate) mod testing {
     use super::*;
 
     pub fn make_test_job(id: &str, payload: &str) -> Job {
-        Job::new(id.to_string(), payload.to_string())
+        Job::with_task_name(id.to_string(), "default".to_string(), payload.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_job_with_task_name_sets_name() {
+        let job = Job::with_task_name(
+            "job-1".to_string(),
+            "send_email".to_string(),
+            "payload".to_string(),
+        );
+        assert_eq!(job.task.name, "send_email");
+        assert_eq!(job.task.payload, "payload");
+        assert_eq!(job.id, "job-1");
     }
 }
