@@ -1,5 +1,7 @@
-use crate::consumer::{self, Consumer};
+#[allow(unused_imports)]
+use crate::consumer::{self, Consumer, RegistryConsumer};
 use crate::error::QueueError;
+use crate::task::TaskRegistry;
 use std::collections::VecDeque;
 use std::sync::{Condvar, Mutex};
 use std::{sync::Arc, thread};
@@ -11,6 +13,7 @@ pub struct Queue {
     jobs: Arc<(Mutex<VecDeque<models::Job>>, Condvar)>,
     dead_letter_jobs: Arc<Mutex<VecDeque<models::DeadLetterJob>>>,
     job_repository: Arc<dyn crate::persistence::JobRepository>,
+    registry: Arc<TaskRegistry>,
     backoff_base: std::time::Duration,
 }
 
@@ -18,6 +21,7 @@ impl Queue {
     pub fn new(
         num_workers: usize,
         job_repository: Arc<dyn crate::persistence::JobRepository>,
+        registry: TaskRegistry,
     ) -> Result<Self, QueueError> {
         let mut workers = Vec::new();
         for i in 0..num_workers {
@@ -40,6 +44,7 @@ impl Queue {
             jobs,
             dead_letter_jobs,
             job_repository,
+            registry: Arc::new(registry),
             backoff_base: std::time::Duration::from_secs(1),
         })
     }
@@ -48,6 +53,23 @@ impl Queue {
         let (lock, _) = &*self.jobs;
         let jobs = lock.lock().unwrap_or_else(|e| e.into_inner());
         jobs.len()
+    }
+
+    pub fn enqueue_by_name<P: serde::Serialize>(
+        &self,
+        task_name: &str,
+        payload: P,
+    ) -> Result<(), QueueError> {
+        if self.registry.get(task_name).is_none() {
+            return Err(QueueError::JobFailed(format!(
+                "no handler registered for task '{task_name}'"
+            )));
+        }
+        let json = serde_json::to_string(&payload)
+            .map_err(|e| QueueError::JobFailed(format!("serialize {task_name}: {e}")))?;
+        let job_id = crate::task::generate_job_id();
+        let job = models::Job::with_task_name(job_id, task_name.to_string(), json);
+        self.enqueue(job)
     }
 
     pub fn enqueue(&self, job: models::Job) -> Result<(), QueueError> {
@@ -61,7 +83,7 @@ impl Queue {
 
     pub fn start_workers(self: &Arc<Self>) {
         for worker in &self.workers {
-            let consumer = consumer::JobConsumer;
+            let consumer = RegistryConsumer::new(Arc::clone(&self.registry));
             let worker = Arc::clone(worker);
             let jobs = Arc::clone(&self.jobs);
             let queue = Arc::clone(self);
@@ -180,16 +202,23 @@ mod tests {
 
     use crate::queue::models::testing::make_test_job;
 
+    fn default_registry() -> TaskRegistry {
+        let mut registry = TaskRegistry::new();
+        registry.register("default", |_| Ok(()));
+        registry
+    }
+
     fn create_queue(num_workers: usize) -> Queue {
         Queue::new(
             num_workers,
             Arc::new(crate::persistence::InMemoryJobRepository::new()),
+            default_registry(),
         )
         .unwrap()
     }
 
     fn create_queue_with_repo(repo: Arc<dyn crate::persistence::JobRepository>) -> Arc<Queue> {
-        Arc::new(Queue::new(0, repo).unwrap())
+        Arc::new(Queue::new(0, repo, default_registry()).unwrap())
     }
 
     struct FailNTimesConsumer {
