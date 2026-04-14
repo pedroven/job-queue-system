@@ -31,6 +31,7 @@ mod tests {
         queue::Queue::new(
             num_workers,
             Arc::new(crate::persistence::InMemoryJobRepository::new()),
+            crate::task::TaskRegistry::new(),
         )
         .unwrap()
     }
