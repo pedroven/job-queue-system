@@ -144,4 +144,18 @@ mod tests {
         assert_eq!(job.task.payload, "payload");
         assert_eq!(job.id, "job-1");
     }
+
+    // Locks the on-disk encoding: `priority as u32` is persisted directly and
+    // `TryFrom<u32>` is how we decode. Reordering variants or changing a
+    // discriminant would silently break existing databases — this test catches
+    // that at compile-of-tests time.
+    #[test]
+    fn test_job_priority_wire_format_is_stable() {
+        assert_eq!(JobPriority::High as u32, 2);
+        assert_eq!(JobPriority::Normal as u32, 1);
+        assert_eq!(JobPriority::try_from(2).unwrap(), JobPriority::High);
+        assert_eq!(JobPriority::try_from(1).unwrap(), JobPriority::Normal);
+        assert!(JobPriority::try_from(0).is_err());
+        assert!(JobPriority::try_from(3).is_err());
+    }
 }
