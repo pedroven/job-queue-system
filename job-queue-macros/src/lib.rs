@@ -39,8 +39,11 @@ pub fn task(attr: TokenStream, item: TokenStream) -> TokenStream {
             max_attempts = lit.base10_parse()?;
             Ok(())
         } else if meta.path.is_ident("priority") {
-            let expr: syn::Expr = meta.value()?.parse()?;
-            priority_expr = quote! { #expr };
+            // Require a path (e.g. `JobPriority::High`) so a stray literal like
+            // `priority = 42` fails at the attribute site, not deep in the
+            // generated code with a type-mismatch error.
+            let path: syn::Path = meta.value()?.parse()?;
+            priority_expr = quote! { #path };
             Ok(())
         } else {
             Err(meta.error("unknown #[task] argument; expected `max_attempts` or `priority`"))
