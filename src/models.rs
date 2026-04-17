@@ -42,6 +42,25 @@ impl std::str::FromStr for JobStatus {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum JobPriority {
+    High = 2,
+    Normal = 1,
+}
+
+impl TryFrom<u32> for JobPriority {
+    type Error = QueueError;
+
+    fn try_from(value: u32) -> Result<Self, Self::Error> {
+        match value {
+            2 => Ok(JobPriority::High),
+            1 => Ok(JobPriority::Normal),
+            _ => Err(QueueError::InvalidPriority(value)),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Job {
     pub id: String,
@@ -49,6 +68,7 @@ pub struct Job {
     pub retry_count: u32,
     pub task: TaskRecord,
     pub max_attempts: u32,
+    pub priority: JobPriority,
     pub created_at: SystemTime,
 }
 
@@ -64,6 +84,7 @@ impl Job {
             status: JobStatus::Pending,
             retry_count: 0,
             max_attempts: 3,
+            priority: JobPriority::Normal,
             created_at: SystemTime::now(),
         }
     }
