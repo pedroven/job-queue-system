@@ -1,17 +1,56 @@
 use crate::consumer::RegistryConsumer;
 use crate::error::QueueError;
-use crate::models::{DeadLetterJob, Job, Worker, WorkerStatus};
+use crate::models::{DeadLetterJob, Job, JobPriority, Worker, WorkerStatus};
 use crate::persistence::JobRepository;
 use crate::task::{TaskRegistry, generate_job_id};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
 mod worker;
 
+/// In-memory staging for pending jobs, keyed by `JobPriority` discriminant
+/// (`u32` via `#[repr(u32)]`). Higher discriminant = higher priority.
+/// Adding a new `JobPriority` variant requires no changes here: `push_back`
+/// creates the level on demand and `pop_next` iterates highest-first.
+#[derive(Default)]
+pub struct JobQueues {
+    levels: BTreeMap<u32, VecDeque<Job>>,
+}
+
+impl JobQueues {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.levels.values().all(VecDeque::is_empty)
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.levels.values().map(VecDeque::len).sum()
+    }
+
+    pub(crate) fn push_back(&mut self, job: Job) {
+        let level = job.priority as u32;
+        self.levels.entry(level).or_default().push_back(job);
+    }
+
+    fn pop_next(&mut self) -> Option<Job> {
+        // BTreeMap iterates in ascending key order; reverse for highest-first.
+        for queue in self.levels.values_mut().rev() {
+            if let Some(job) = queue.pop_front() {
+                return Some(job);
+            }
+        }
+        None
+    }
+
+    #[cfg(test)]
+    pub(crate) fn queue_for(&self, priority: JobPriority) -> Option<&VecDeque<Job>> {
+        self.levels.get(&(priority as u32))
+    }
+}
+
 pub struct Queue {
     pub(crate) workers: Vec<Arc<Mutex<Worker>>>,
-    pub(crate) jobs: Arc<(Mutex<VecDeque<Job>>, Condvar)>,
+    pub(crate) jobs: Arc<(Mutex<JobQueues>, Condvar)>,
     pub(crate) dead_letter_jobs: Arc<Mutex<VecDeque<DeadLetterJob>>>,
     pub(crate) job_repository: Arc<dyn JobRepository>,
     pub(crate) registry: Arc<TaskRegistry>,
@@ -32,12 +71,16 @@ impl Queue {
                 current_job_id: None,
             })));
         }
-        // Restore pending jobs from the repository. No cvar notification is needed
-        // because workers haven't started yet — when they first call wait_for_job,
-        // the while-loop check finds the deque non-empty and proceeds immediately.
+        // Restore pending jobs from the repository. JobQueues::push_back routes
+        // each into the level matching its stored priority. No cvar notification
+        // is needed because workers haven't started yet.
         let jobs_from_repo = job_repository.find_all_pending()?;
+        let mut job_queues = JobQueues::default();
+        for job in jobs_from_repo {
+            job_queues.push_back(job);
+        }
         let dead_jobs_from_repo = job_repository.find_all_dead_letter()?;
-        let jobs = Arc::new((Mutex::new(VecDeque::from(jobs_from_repo)), Condvar::new()));
+        let jobs = Arc::new((Mutex::new(job_queues), Condvar::new()));
         let dead_letter_jobs = Arc::new(Mutex::new(VecDeque::from(dead_jobs_from_repo)));
 
         Ok(Queue {
@@ -57,7 +100,9 @@ impl Queue {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        let (lock, _) = &*self.jobs;
+        let jobs = lock.lock().unwrap_or_else(|e| e.into_inner());
+        jobs.is_empty()
     }
 
     pub fn enqueue_by_name<P: serde::Serialize>(
@@ -65,6 +110,31 @@ impl Queue {
         task_name: &str,
         payload: P,
     ) -> Result<(), QueueError> {
+        let job = self.build_named_job(task_name, payload)?;
+        self.enqueue(job)
+    }
+
+    /// Dynamic-dispatch sibling of `enqueue_by_name` that also sets
+    /// `max_attempts` and `priority` — the same knobs the `#[task(...)]`
+    /// macro exposes for statically-known tasks.
+    pub fn enqueue_by_name_with_opts<P: serde::Serialize>(
+        &self,
+        task_name: &str,
+        payload: P,
+        max_attempts: u32,
+        priority: JobPriority,
+    ) -> Result<(), QueueError> {
+        let mut job = self.build_named_job(task_name, payload)?;
+        job.max_attempts = max_attempts;
+        job.priority = priority;
+        self.enqueue(job)
+    }
+
+    fn build_named_job<P: serde::Serialize>(
+        &self,
+        task_name: &str,
+        payload: P,
+    ) -> Result<Job, QueueError> {
         if self.registry.get(task_name).is_none() {
             return Err(QueueError::JobFailed(format!(
                 "no handler registered for task '{task_name}'"
@@ -73,17 +143,24 @@ impl Queue {
         let json = serde_json::to_string(&payload)
             .map_err(|e| QueueError::JobFailed(format!("serialize {task_name}: {e}")))?;
         let job_id = generate_job_id();
-        let job = Job::with_task_name(job_id, task_name.to_string(), json);
-        self.enqueue(job)
+        Ok(Job::with_task_name(job_id, task_name.to_string(), json))
     }
 
+    /// Enqueue a job. The level it lands in is determined by `job.priority`
+    /// — persistence and in-memory routing agree on a single source of truth.
     pub fn enqueue(&self, job: Job) -> Result<(), QueueError> {
-        let (lock, cvar) = &*self.jobs;
         self.job_repository.save(&job)?;
+        let (lock, cvar) = &*self.jobs;
         let mut jobs = lock.lock()?;
         jobs.push_back(job);
         cvar.notify_one();
         Ok(())
+    }
+
+    /// Convenience wrapper: force the job to `High` priority and enqueue.
+    pub fn enqueue_priority(&self, mut job: Job) -> Result<(), QueueError> {
+        job.priority = JobPriority::High;
+        self.enqueue(job)
     }
 
     pub fn start_workers(self: &Arc<Self>) {
@@ -94,8 +171,7 @@ impl Queue {
             let queue = Arc::clone(self);
             thread::spawn(move || {
                 loop {
-                    let job = Self::wait_for_job(&jobs);
-                    if let Some(job) = job {
+                    if let Some(job) = Self::wait_for_job(&jobs) {
                         worker::process_job(&worker, &consumer, job, &queue);
                     }
                 }
@@ -103,13 +179,13 @@ impl Queue {
         }
     }
 
-    pub(crate) fn wait_for_job(jobs: &(Mutex<VecDeque<Job>>, Condvar)) -> Option<Job> {
+    pub(crate) fn wait_for_job(jobs: &(Mutex<JobQueues>, Condvar)) -> Option<Job> {
         let (lock, cvar) = jobs;
         let mut jobs = lock.lock().unwrap_or_else(|e| e.into_inner());
         while jobs.is_empty() {
             jobs = cvar.wait(jobs).unwrap_or_else(|e| e.into_inner());
         }
-        jobs.pop_front()
+        jobs.pop_next()
     }
 }
 
@@ -118,9 +194,9 @@ mod tests {
     use super::*;
     use crate::consumer::{self, Consumer};
     use crate::models::{self, testing::make_test_job};
-    use crate::persistence::{InMemoryJobRepository, JobRepository};
+    use crate::persistence::{InMemoryJobRepository, JobRepository, SqliteJobRepository};
     use std::sync::Mutex as StdMutex;
-    use std::time::Duration;
+    use std::time::{Duration, UNIX_EPOCH};
 
     fn default_registry() -> TaskRegistry {
         let mut registry = TaskRegistry::new();
@@ -196,7 +272,8 @@ mod tests {
         let (lock, _) = &*queue.jobs;
         let jobs = lock.lock().unwrap();
         assert_eq!(jobs.len(), 1);
-        assert_eq!(jobs[0].id, "job-1");
+        let normal = jobs.queue_for(JobPriority::Normal).unwrap();
+        assert_eq!(normal[0].id, "job-1");
     }
 
     #[test]
@@ -209,14 +286,15 @@ mod tests {
         let (lock, _) = &*queue.jobs;
         let jobs = lock.lock().unwrap();
         assert_eq!(jobs.len(), 3);
-        assert_eq!(jobs[0].id, "job-1");
-        assert_eq!(jobs[1].id, "job-2");
-        assert_eq!(jobs[2].id, "job-3");
+        let normal = jobs.queue_for(JobPriority::Normal).unwrap();
+        assert_eq!(normal[0].id, "job-1");
+        assert_eq!(normal[1].id, "job-2");
+        assert_eq!(normal[2].id, "job-3");
     }
 
     #[test]
     fn test_wait_for_job_returns_front_job() {
-        let jobs = Arc::new((Mutex::new(VecDeque::new()), Condvar::new()));
+        let jobs = Arc::new((Mutex::new(JobQueues::default()), Condvar::new()));
         {
             let (lock, _) = &*jobs;
             let mut q = lock.lock().unwrap();
@@ -225,6 +303,69 @@ mod tests {
         let result = Queue::wait_for_job(&jobs);
         assert!(result.is_some());
         assert_eq!(result.unwrap().id, "job-1");
+    }
+
+    #[test]
+    fn test_enqueue_priority_drains_before_normal() {
+        let queue = create_queue(0);
+        queue.enqueue(make_test_job("n-1", "normal")).unwrap();
+        queue
+            .enqueue_priority(make_test_job("p-1", "priority"))
+            .unwrap();
+        queue.enqueue(make_test_job("n-2", "normal")).unwrap();
+
+        let first = Queue::wait_for_job(&queue.jobs).unwrap();
+        assert_eq!(first.id, "p-1");
+        let second = Queue::wait_for_job(&queue.jobs).unwrap();
+        assert_eq!(second.id, "n-1");
+        let third = Queue::wait_for_job(&queue.jobs).unwrap();
+        assert_eq!(third.id, "n-2");
+    }
+
+    #[test]
+    fn test_enqueue_priority_persists_with_high_priority() {
+        let repo = Arc::new(InMemoryJobRepository::new());
+        let queue = Queue::new(0, repo.clone(), default_registry()).unwrap();
+        queue
+            .enqueue_priority(make_test_job("p-1", "payload"))
+            .unwrap();
+
+        let persisted = repo.find_by_id("p-1").unwrap();
+        assert_eq!(persisted.priority, models::JobPriority::High);
+    }
+
+    #[test]
+    fn test_restart_reloads_priority_first_then_fifo() {
+        // SqliteJobRepository enforces `ORDER BY priority DESC, created_at ASC`
+        // on recovery, and Queue::new routes each restored job into the matching
+        // level. The combination must yield: all High jobs first (in insertion
+        // order), then all Normal jobs (in insertion order).
+        let repo = Arc::new(SqliteJobRepository::new(":memory:").unwrap());
+
+        let mut n1 = make_test_job("n-1", "normal-first");
+        n1.created_at = UNIX_EPOCH + Duration::from_secs(1);
+        repo.save(&n1).unwrap();
+
+        let mut p1 = make_test_job("p-1", "priority-first");
+        p1.priority = models::JobPriority::High;
+        p1.created_at = UNIX_EPOCH + Duration::from_secs(2);
+        repo.save(&p1).unwrap();
+
+        let mut n2 = make_test_job("n-2", "normal-second");
+        n2.created_at = UNIX_EPOCH + Duration::from_secs(3);
+        repo.save(&n2).unwrap();
+
+        let mut p2 = make_test_job("p-2", "priority-second");
+        p2.priority = models::JobPriority::High;
+        p2.created_at = UNIX_EPOCH + Duration::from_secs(4);
+        repo.save(&p2).unwrap();
+
+        let queue = Queue::new(0, repo.clone(), default_registry()).unwrap();
+
+        let drained: Vec<String> = (0..4)
+            .map(|_| Queue::wait_for_job(&queue.jobs).unwrap().id)
+            .collect();
+        assert_eq!(drained, vec!["p-1", "p-2", "n-1", "n-2"]);
     }
 
     #[test]
