@@ -27,7 +27,27 @@ use syn::{
 /// sum.perform_async((1, 2))?;
 /// ```
 #[proc_macro_attribute]
-pub fn task(_attr: TokenStream, item: TokenStream) -> TokenStream {
+pub fn task(attr: TokenStream, item: TokenStream) -> TokenStream {
+    // Default matches `Job::with_task_name` which sets `max_attempts = 3`.
+    let mut max_attempts: u32 = 3;
+    let mut priority_expr: TokenStream2 =
+        quote! { ::job_queue_system::models::JobPriority::Normal };
+
+    let parser = syn::meta::parser(|meta| {
+        if meta.path.is_ident("max_attempts") {
+            let lit: syn::LitInt = meta.value()?.parse()?;
+            max_attempts = lit.base10_parse()?;
+            Ok(())
+        } else if meta.path.is_ident("priority") {
+            let expr: syn::Expr = meta.value()?.parse()?;
+            priority_expr = quote! { #expr };
+            Ok(())
+        } else {
+            Err(meta.error("unknown #[task] argument; expected `max_attempts` or `priority`"))
+        }
+    });
+    parse_macro_input!(attr with parser);
+
     let input = parse_macro_input!(item as ItemFn);
     let vis = &input.vis;
     let fn_name = &input.sig.ident;
@@ -98,11 +118,17 @@ pub fn task(_attr: TokenStream, item: TokenStream) -> TokenStream {
         }
 
         impl #task_struct_name {
-            /// Enqueue this task onto the globally-installed queue.
+            /// Enqueue this task onto the globally-installed queue using the
+            /// `max_attempts` and `priority` baked in at macro expansion.
             pub fn perform_async(&self, #(#param_names: #owned_tys),*)
                 -> ::std::result::Result<(), ::job_queue_system::error::QueueError>
             {
-                ::job_queue_system::task::enqueue(self.name, #payload_tuple_expr)
+                ::job_queue_system::task::enqueue_with_opts(
+                    self.name,
+                    #payload_tuple_expr,
+                    #max_attempts,
+                    #priority_expr,
+                )
             }
         }
 
