@@ -3,7 +3,7 @@ use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::error::QueueError;
-use crate::models::{DeadLetterJob, Job, JobStatus, TaskRecord};
+use crate::models::{DeadLetterJob, Job, JobPriority, JobStatus, TaskRecord};
 use crate::persistence::JobRepository;
 
 pub struct SqliteJobRepository {
@@ -22,8 +22,11 @@ impl SqliteJobRepository {
                 task_name TEXT NOT NULL DEFAULT 'default',
                 payload TEXT NOT NULL,
                 max_attempts INTEGER NOT NULL,
+                priority INTEGER NOT NULL DEFAULT 1,
                 created_at INTEGER NOT NULL
-            );",
+            );
+            CREATE INDEX IF NOT EXISTS idx_jobs_status_priority_created
+                ON jobs(status, priority DESC, created_at ASC);",
         )?;
 
         conn.execute_batch(
@@ -54,12 +57,23 @@ fn epoch_to_system_time(secs: u64) -> SystemTime {
     UNIX_EPOCH + Duration::from_secs(secs)
 }
 
+/// Decode a stored priority discriminant, defaulting to `Normal` with a
+/// warning if the value is unknown. Keeps `Queue::new` able to boot even if
+/// a row has a priority we don't recognize (e.g. rolled back a release that
+/// wrote a new variant).
+fn decode_priority(job_id: &str, raw: u32) -> JobPriority {
+    JobPriority::try_from(raw).unwrap_or_else(|_| {
+        eprintln!("unknown priority {raw} on job {job_id}; defaulting to Normal");
+        JobPriority::Normal
+    })
+}
+
 impl JobRepository for SqliteJobRepository {
     fn save(&self, job: &Job) -> Result<(), QueueError> {
         let conn = self.conn.lock()?;
         conn.execute(
-            "INSERT INTO jobs (id, status, retry_count, task_id, task_name, payload, max_attempts, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO jobs (id, status, retry_count, task_id, task_name, payload, max_attempts, priority, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             (
                 &job.id,
                 job.status.as_str(),
@@ -68,6 +82,7 @@ impl JobRepository for SqliteJobRepository {
                 &job.task.name,
                 &job.task.payload,
                 job.max_attempts,
+                job.priority as u32,
                 system_time_to_epoch(job.created_at),
             ),
         )?;
@@ -77,7 +92,7 @@ impl JobRepository for SqliteJobRepository {
     fn find_by_id(&self, job_id: &str) -> Result<Job, QueueError> {
         let conn = self.conn.lock()?;
         let mut stmt = conn.prepare(
-            "SELECT id, status, retry_count, task_id, task_name, payload, max_attempts, created_at
+            "SELECT id, status, retry_count, task_id, task_name, payload, max_attempts, priority, created_at
              FROM jobs WHERE id = ?1",
         )?;
 
@@ -91,13 +106,24 @@ impl JobRepository for SqliteJobRepository {
                     row.get::<_, String>(4)?,
                     row.get::<_, String>(5)?,
                     row.get::<_, u32>(6)?,
-                    row.get::<_, u64>(7)?,
+                    row.get::<_, u32>(7)?,
+                    row.get::<_, u64>(8)?,
                 ))
             })
             .map_err(|_| QueueError::NotFound(job_id.to_string()))?;
 
-        let (id, status_str, retry_count, task_id, task_name, payload, max_attempts, created_at) =
-            row;
+        let (
+            id,
+            status_str,
+            retry_count,
+            task_id,
+            task_name,
+            payload,
+            max_attempts,
+            priority,
+            created_at,
+        ) = row;
+        let decoded_priority = decode_priority(&id, priority);
         Ok(Job {
             id,
             status: status_str.parse()?,
@@ -108,6 +134,7 @@ impl JobRepository for SqliteJobRepository {
                 payload,
             },
             max_attempts,
+            priority: decoded_priority,
             created_at: epoch_to_system_time(created_at),
         })
     }
@@ -133,8 +160,8 @@ impl JobRepository for SqliteJobRepository {
     fn find_all_pending(&self) -> Result<Vec<Job>, QueueError> {
         let conn = self.conn.lock()?;
         let mut stmt = conn.prepare(
-            "SELECT id, status, retry_count, task_id, task_name, payload, max_attempts, created_at
-             FROM jobs WHERE status = 'pending' ORDER BY created_at ASC",
+            "SELECT id, status, retry_count, task_id, task_name, payload, max_attempts, priority, created_at
+             FROM jobs WHERE status = 'pending' ORDER BY priority DESC, created_at ASC",
         )?;
 
         let rows = stmt
@@ -147,15 +174,26 @@ impl JobRepository for SqliteJobRepository {
                     row.get::<_, String>(4)?,
                     row.get::<_, String>(5)?,
                     row.get::<_, u32>(6)?,
-                    row.get::<_, u64>(7)?,
+                    row.get::<_, u32>(7)?,
+                    row.get::<_, u64>(8)?,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
 
         let mut jobs = Vec::with_capacity(rows.len());
-        for (id, status_str, retry_count, task_id, task_name, payload, max_attempts, created_at) in
-            rows
+        for (
+            id,
+            status_str,
+            retry_count,
+            task_id,
+            task_name,
+            payload,
+            max_attempts,
+            priority,
+            created_at,
+        ) in rows
         {
+            let decoded_priority = decode_priority(&id, priority);
             jobs.push(Job {
                 id,
                 status: status_str.parse()?,
@@ -166,6 +204,7 @@ impl JobRepository for SqliteJobRepository {
                     payload,
                 },
                 max_attempts,
+                priority: decoded_priority,
                 created_at: epoch_to_system_time(created_at),
             });
         }
