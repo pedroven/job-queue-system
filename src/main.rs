@@ -1,10 +1,11 @@
 use std::sync::Arc;
 
 use job_queue_system::error::QueueError;
+use job_queue_system::models::JobPriority;
 use job_queue_system::task_registry;
 use job_queue_system::{persistence, queue, task};
 
-#[task]
+#[task(max_attempts = 5, priority = JobPriority::High)]
 fn send_email(to: String) -> Result<(), QueueError> {
     println!("Sending email to: {to}");
     Ok(())
@@ -16,7 +17,7 @@ fn process_image(path: String) -> Result<(), QueueError> {
     Ok(())
 }
 
-#[task]
+#[task(max_attempts = 1)]
 fn sum_two_numbers(a: &i32, b: &i32) -> i32 {
     let result = a + b;
     println!("sum({a}, {b}) = {result}");
