@@ -6,7 +6,7 @@ use serde::de::DeserializeOwned;
 use uuid::Uuid;
 
 use crate::error::QueueError;
-use crate::models::Job;
+use crate::models::{Job, JobPriority};
 
 pub type TaskHandler = fn(&str) -> Result<(), QueueError>;
 
@@ -28,8 +28,23 @@ impl TaskDefinition {
 /// Shared enqueue logic used by every macro-generated `perform_async`.
 /// `Args` is the tuple of the task's arguments.
 pub fn enqueue<Args: Serialize>(task_name: &'static str, args: Args) -> Result<(), QueueError> {
+    enqueue_with_opts(task_name, args, 3, JobPriority::Normal)
+}
+
+/// Enqueue with caller-provided `max_attempts` and `priority`. Used by the
+/// `#[task(max_attempts = …, priority = …)]` macro to bake per-task defaults
+/// into the generated `perform_async`. `Queue::enqueue` routes to the correct
+/// level based on `job.priority`.
+pub fn enqueue_with_opts<Args: Serialize>(
+    task_name: &'static str,
+    args: Args,
+    max_attempts: u32,
+    priority: JobPriority,
+) -> Result<(), QueueError> {
     let payload = serialize_payload(task_name, &args)?;
-    let job = Job::with_task_name(generate_job_id(), task_name.to_string(), payload);
+    let mut job = Job::with_task_name(generate_job_id(), task_name.to_string(), payload);
+    job.max_attempts = max_attempts;
+    job.priority = priority;
     global_queue().enqueue(job)
 }
 
