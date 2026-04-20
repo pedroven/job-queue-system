@@ -9,6 +9,8 @@ pub enum QueueError {
     InvalidStatus(String),
     InvalidPriority(u32),
     JobFailed(String),
+    QueueFull { depth: u64, hard_threshold: u64 },
+    InvalidConfig(String),
 }
 
 impl fmt::Display for QueueError {
@@ -21,6 +23,14 @@ impl fmt::Display for QueueError {
             QueueError::InvalidStatus(s) => write!(f, "invalid status: {s}"),
             QueueError::InvalidPriority(p) => write!(f, "invalid priority: {p}"),
             QueueError::JobFailed(msg) => write!(f, "job failed: {msg}"),
+            QueueError::QueueFull {
+                depth,
+                hard_threshold,
+            } => write!(
+                f,
+                "queue full: depth {depth} >= hard_threshold {hard_threshold}"
+            ),
+            QueueError::InvalidConfig(msg) => write!(f, "invalid config: {msg}"),
         }
     }
 }
