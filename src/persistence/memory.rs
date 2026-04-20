@@ -53,6 +53,14 @@ impl JobRepository for InMemoryJobRepository {
         Ok(pending)
     }
 
+    fn pending_count(&self) -> Result<u64, QueueError> {
+        let jobs = self.jobs.lock()?;
+        Ok(jobs
+            .iter()
+            .filter(|j| j.status == JobStatus::Pending)
+            .count() as u64)
+    }
+
     fn find_all_dead_letter(&self) -> Result<Vec<DeadLetterJob>, QueueError> {
         let dl_jobs = self.dead_letter_jobs.lock()?;
         Ok(dl_jobs.clone())
@@ -166,6 +174,18 @@ mod tests {
         repo.update_retry_count("job-1", 3).unwrap();
         let job = repo.find_by_id("job-1").unwrap();
         assert_eq!(job.retry_count, 3);
+    }
+
+    #[test]
+    fn test_in_memory_pending_count_excludes_non_pending() {
+        let repo = InMemoryJobRepository::new();
+        repo.save(&make_test_job("job-1", "p1")).unwrap();
+        repo.save(&make_test_job("job-2", "p2")).unwrap();
+        repo.save(&make_test_job("job-3", "p3")).unwrap();
+        repo.update_status("job-2", JobStatus::Running).unwrap();
+        repo.update_status("job-3", JobStatus::Completed).unwrap();
+
+        assert_eq!(repo.pending_count().unwrap(), 1);
     }
 
     #[test]
