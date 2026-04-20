@@ -212,6 +212,17 @@ impl JobRepository for SqliteJobRepository {
         Ok(jobs)
     }
 
+    fn pending_count(&self) -> Result<u64, QueueError> {
+        // Uses idx_jobs_status_priority_created (leftmost column = status).
+        let conn = self.conn.lock()?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM jobs WHERE status = 'pending'",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(u64::try_from(count).unwrap_or(0))
+    }
+
     fn find_all_dead_letter(&self) -> Result<Vec<DeadLetterJob>, QueueError> {
         let conn = self.conn.lock()?;
         let mut stmt = conn.prepare(
@@ -402,6 +413,18 @@ mod tests {
         let repo = SqliteJobRepository::new(":memory:").unwrap();
         let result = repo.update_retry_count("nonexistent", 1);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_sqlite_pending_count_excludes_non_pending() {
+        let repo = SqliteJobRepository::new(":memory:").unwrap();
+        repo.save(&make_test_job("job-1", "p1")).unwrap();
+        repo.save(&make_test_job("job-2", "p2")).unwrap();
+        repo.save(&make_test_job("job-3", "p3")).unwrap();
+        repo.update_status("job-2", JobStatus::Running).unwrap();
+        repo.update_status("job-3", JobStatus::Completed).unwrap();
+
+        assert_eq!(repo.pending_count().unwrap(), 1);
     }
 
     #[test]
