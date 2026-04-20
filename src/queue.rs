@@ -6,6 +6,7 @@ use crate::task::{TaskRegistry, generate_job_id};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
+use std::time::Duration;
 
 mod worker;
 
@@ -48,13 +49,62 @@ impl JobQueues {
     }
 }
 
+/// Tunable parameters for a `Queue`. All fields have sensible defaults via
+/// `QueueConfig::default()`; override selectively when constructing a queue
+/// via `Queue::with_config`.
+///
+/// Back-pressure note: the hard threshold is advisory, not an invariant.
+/// `pending_count()` and `enqueue()` are not serialized, so under concurrent
+/// producers the actual depth may briefly exceed `backpressure_hard_threshold`
+/// by up to `N-1` (N = live producers). Set the threshold below the real
+/// capacity if strict bounding matters.
+#[derive(Clone, Debug)]
+pub struct QueueConfig {
+    /// Retry backoff base for failed jobs (`backoff_base * 2^attempt`).
+    pub retry_backoff_base: Duration,
+    /// Pending-job count at which producers start to throttle.
+    pub backpressure_soft_threshold: u64,
+    /// Pending-job count at which producers are rejected with `QueueFull`.
+    pub backpressure_hard_threshold: u64,
+    /// Sleep applied on each produce call once depth is between soft and hard.
+    pub backpressure_delay: Duration,
+}
+
+impl QueueConfig {
+    fn validate(&self) -> Result<(), QueueError> {
+        if self.backpressure_hard_threshold == 0 {
+            return Err(QueueError::InvalidConfig(
+                "backpressure_hard_threshold must be > 0".into(),
+            ));
+        }
+        if self.backpressure_soft_threshold > self.backpressure_hard_threshold {
+            return Err(QueueError::InvalidConfig(format!(
+                "backpressure_soft_threshold ({}) must be <= backpressure_hard_threshold ({})",
+                self.backpressure_soft_threshold, self.backpressure_hard_threshold
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl Default for QueueConfig {
+    fn default() -> Self {
+        Self {
+            retry_backoff_base: Duration::from_secs(1),
+            backpressure_soft_threshold: 80,
+            backpressure_hard_threshold: 100,
+            backpressure_delay: Duration::from_millis(50),
+        }
+    }
+}
+
 pub struct Queue {
     pub(crate) workers: Vec<Arc<Mutex<Worker>>>,
     pub(crate) jobs: Arc<(Mutex<JobQueues>, Condvar)>,
     pub(crate) dead_letter_jobs: Arc<Mutex<VecDeque<DeadLetterJob>>>,
     pub(crate) job_repository: Arc<dyn JobRepository>,
     pub(crate) registry: Arc<TaskRegistry>,
-    pub(crate) backoff_base: std::time::Duration,
+    pub(crate) config: QueueConfig,
 }
 
 impl Queue {
@@ -63,6 +113,21 @@ impl Queue {
         job_repository: Arc<dyn JobRepository>,
         registry: TaskRegistry,
     ) -> Result<Self, QueueError> {
+        Self::with_config(
+            num_workers,
+            job_repository,
+            registry,
+            QueueConfig::default(),
+        )
+    }
+
+    pub fn with_config(
+        num_workers: usize,
+        job_repository: Arc<dyn JobRepository>,
+        registry: TaskRegistry,
+        config: QueueConfig,
+    ) -> Result<Self, QueueError> {
+        config.validate()?;
         let mut workers = Vec::new();
         for i in 0..num_workers {
             workers.push(Arc::new(Mutex::new(Worker {
@@ -89,7 +154,7 @@ impl Queue {
             dead_letter_jobs,
             job_repository,
             registry: Arc::new(registry),
-            backoff_base: std::time::Duration::from_secs(1),
+            config,
         })
     }
 
@@ -97,6 +162,10 @@ impl Queue {
         let (lock, _) = &*self.jobs;
         let jobs = lock.lock().unwrap_or_else(|e| e.into_inner());
         jobs.len()
+    }
+
+    pub fn pending_count(&self) -> Result<u64, QueueError> {
+        self.job_repository.pending_count()
     }
 
     pub fn is_empty(&self) -> bool {
