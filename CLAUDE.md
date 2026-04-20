@@ -22,13 +22,12 @@ cargo clippy
 
 - `src/main.rs` — Entry point. Creates the queue, starts workers, and reads payloads from stdin in a loop.
 - `src/lib.rs` — Crate root. Declares modules and re-exports (`QueueError`, `#[task]` macro).
-- `src/queue.rs` — Core `Queue` struct. Manages workers, job enqueueing, and dispatching via `Mutex`/`Condvar`.
-- `src/queue/` — Queue submodules (e.g. configuration, back pressure helpers).
+- `src/queue.rs` + `src/queue/` — module root declares submodules and re-exports. `queue/core.rs` holds the `Queue` struct (workers, enqueueing, dispatch via `Mutex`/`Condvar`), `queue/config.rs` the `QueueConfig` + validation, `queue/levels.rs` the `JobQueues` priority-keyed staging, `queue/worker.rs` the worker `process_job` / `handle_job_tries` helpers.
 - `src/models.rs` — Data models: `Job`, `TaskRecord`, `Worker`, `DeadLetterJob`, and their status enums.
 - `src/producer.rs` — `Producer` trait and `JobProducer` implementation that enqueues jobs.
 - `src/consumer.rs` — `Consumer` trait and `JobConsumer` implementation that processes jobs.
 - `src/persistence.rs` + `src/persistence/` — `JobRepository` trait with `SqliteJobRepository` (production) and `InMemoryJobRepository` (tests).
-- `src/scheduler.rs` — `Scheduler` + `ScheduledJobRepository` trait. Evaluates cron-defined `ScheduledJob`s and enqueues due jobs via `Producer`.
+- `src/scheduler.rs` + `src/scheduler/` — module root declares submodules and re-exports. `scheduler/model.rs` holds `ScheduledJob` + `ScheduledJobRepository` trait, `scheduler/memory.rs` the in-memory impl, `scheduler/sqlite.rs` the `SqliteScheduledJobRepository`, `scheduler/runner.rs` the `Scheduler` + `SchedulerHandle` (cron evaluation and the background tick thread started via `Scheduler::start`).
 - `src/task.rs` — Task registry and handler trait used by consumers.
 - `src/error.rs` — `QueueError` enum used across the crate.
 - `job-queue-macros/` — Proc-macro crate providing `#[task]`.
@@ -57,6 +56,7 @@ Always run `cargo test` before considering a change complete.
 - Concurrency via `Arc<Mutex<T>>` and `Condvar` (no async runtime).
 - Traits (`Producer`, `Consumer`) define the public interfaces for producing and consuming jobs.
 - Keep methods short and focused — extract helpers for distinct logical steps.
+- **500-line file limit.** No `.rs` file (including tests in the same file) may exceed 500 lines. When approaching the limit, split the file into a module folder following the `persistence.rs` + `persistence/` pattern: the flat file declares submodules and re-exports; each submodule holds one cohesive concept (trait, impl, model). Run `wc -l src/**/*.rs` before finishing a task that added substantial code.
 
 ## Dependencies
 
