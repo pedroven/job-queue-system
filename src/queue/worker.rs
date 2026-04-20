@@ -27,7 +27,7 @@ pub(crate) fn process_job(
         eprintln!("Failed to update job {job_id} to Running: {e}");
     }
 
-    if let Err(e) = handle_job_tries(queue, consumer, job, queue.backoff_base) {
+    if let Err(e) = handle_job_tries(queue, consumer, job, queue.config.retry_backoff_base) {
         eprintln!("Failed to handle job tries: {e}");
     }
 
