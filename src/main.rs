@@ -1,7 +1,12 @@
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use job_queue_system::error::QueueError;
 use job_queue_system::models::JobPriority;
+use job_queue_system::producer::JobProducer;
+use job_queue_system::scheduler::{
+    ScheduledJob, ScheduledJobRepository, Scheduler, SqliteScheduledJobRepository,
+};
 use job_queue_system::task_registry;
 use job_queue_system::{persistence, queue, task};
 
@@ -38,6 +43,15 @@ fn main() {
     queue.start_workers();
     task::set_global_queue(Arc::clone(&queue)).expect("global queue already installed");
 
+    let scheduled_repo: Arc<dyn ScheduledJobRepository> = Arc::new(
+        SqliteScheduledJobRepository::new(&db_path).expect("Failed to open scheduled_jobs store"),
+    );
+    seed_default_schedules(scheduled_repo.as_ref());
+
+    let producer = Arc::new(JobProducer::new(Arc::clone(&queue)));
+    let scheduler = Scheduler::new(Arc::clone(&scheduled_repo), producer);
+    let _scheduler_handle = scheduler.start(Duration::from_secs(1));
+
     loop {
         println!("Enter task (send_email / process_image / sum):");
         let mut task_name = String::new();
@@ -60,6 +74,46 @@ fn main() {
         };
         if let Err(e) = result {
             eprintln!("{e:?}");
+        }
+    }
+}
+
+/// Registers the demo recurring schedules on first boot only. Uses
+/// `save_if_absent` so restarts don't clobber persisted `last_run_at` /
+/// `next_run_at` progress on rows the scheduler has already advanced.
+///
+/// Cron dialect: 7 fields — `sec min hour dom mon dow year` — driven by the
+/// `cron` crate. This is NOT standard 5-field Unix cron; pasting `"*/5 * * * *"`
+/// will fail with `QueueError::InvalidCron`.
+fn seed_default_schedules(repo: &dyn ScheduledJobRepository) {
+    let specs = [
+        (
+            "daily-report",
+            "process_image",
+            "daily.png",
+            "0 0 9 * * * *",
+        ),
+        (
+            "heartbeat",
+            "send_email",
+            "ops@example.com",
+            "0 */5 * * * * *",
+        ),
+    ];
+    for (id, task_name, payload, cron) in specs {
+        match ScheduledJob::new(
+            id.into(),
+            task_name.into(),
+            payload.into(),
+            cron.into(),
+            SystemTime::now(),
+        ) {
+            Ok(job) => {
+                if let Err(e) = repo.save_if_absent(&job) {
+                    eprintln!("failed to seed schedule {id}: {e}");
+                }
+            }
+            Err(e) => eprintln!("invalid schedule {id}: {e}"),
         }
     }
 }
