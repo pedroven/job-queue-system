@@ -27,7 +27,7 @@ cargo clippy
 - `src/producer.rs` — `Producer` trait and `JobProducer` implementation that enqueues jobs.
 - `src/consumer.rs` — `Consumer` trait and `JobConsumer` implementation that processes jobs.
 - `src/persistence.rs` + `src/persistence/` — `JobRepository` trait with `SqliteJobRepository` (production) and `InMemoryJobRepository` (tests).
-- `src/scheduler.rs` + `src/scheduler/` — module root declares submodules and re-exports. `scheduler/model.rs` holds `ScheduledJob` + `ScheduledJobRepository` trait, `scheduler/memory.rs` the in-memory impl, `scheduler/sqlite.rs` the `SqliteScheduledJobRepository`, `scheduler/runner.rs` the `Scheduler` + `SchedulerHandle` (cron evaluation and the background tick thread started via `Scheduler::start`).
+- `src/scheduler.rs` + `src/scheduler/` — module root declares submodules and re-exports. `scheduler/model.rs` holds `ScheduledJob` + `ScheduledJobRepository` trait, `scheduler/memory.rs` the in-memory impl, `scheduler/sqlite.rs` the `SqliteScheduledJobRepository`, `scheduler/runner.rs` the `Scheduler` + `SchedulerHandle` (cron evaluation and the background tick thread started via `Scheduler::start`) with tests in `scheduler/runner/tests.rs`.
 - `src/task.rs` — Task registry and handler trait used by consumers.
 - `src/error.rs` — `QueueError` enum used across the crate.
 - `job-queue-macros/` — Proc-macro crate providing `#[task]`.
