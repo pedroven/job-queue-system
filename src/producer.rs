@@ -4,7 +4,7 @@ use crate::error::QueueError;
 use crate::models::Job;
 use crate::queue::Queue;
 
-pub trait Producer {
+pub trait Producer: Send + Sync {
     fn produce(&self, job: Job) -> Result<(), QueueError>;
 }
 
