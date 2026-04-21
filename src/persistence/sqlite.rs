@@ -1,4 +1,4 @@
-use rusqlite::Connection;
+use rusqlite::{Connection, ErrorCode};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -77,7 +77,7 @@ fn decode_priority(job_id: &str, raw: u32) -> JobPriority {
 impl JobRepository for SqliteJobRepository {
     fn save(&self, job: &Job) -> Result<(), QueueError> {
         let conn = self.conn.lock()?;
-        conn.execute(
+        let res = conn.execute(
             "INSERT INTO jobs (id, status, retry_count, task_id, task_name, payload, max_attempts, priority, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             (
@@ -91,8 +91,20 @@ impl JobRepository for SqliteJobRepository {
                 job.priority as u32,
                 system_time_to_epoch(job.created_at),
             ),
-        )?;
-        Ok(())
+        );
+        match res {
+            Ok(_) => Ok(()),
+            // The INSERT's only constraint is the `id` primary key, so any
+            // constraint violation means the id was already present. Normalize
+            // to `AlreadyExists` to match InMemoryJobRepository and give the
+            // scheduler's idempotent re-fire path a stable error to match on.
+            Err(rusqlite::Error::SqliteFailure(err, _))
+                if err.code == ErrorCode::ConstraintViolation =>
+            {
+                Err(QueueError::AlreadyExists(job.id.clone()))
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 
     fn find_by_id(&self, job_id: &str) -> Result<Job, QueueError> {
@@ -311,6 +323,18 @@ mod tests {
             },
             error: "something went wrong".to_string(),
             failed_at: SystemTime::now(),
+        }
+    }
+
+    #[test]
+    fn test_sqlite_save_duplicate_id_returns_already_exists() {
+        let repo = SqliteJobRepository::new(":memory:").unwrap();
+        repo.save(&make_test_job("job-1", "payload")).unwrap();
+
+        let err = repo.save(&make_test_job("job-1", "payload")).unwrap_err();
+        match err {
+            QueueError::AlreadyExists(id) => assert_eq!(id, "job-1"),
+            other => panic!("expected AlreadyExists, got {other:?}"),
         }
     }
 
