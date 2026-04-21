@@ -11,6 +11,7 @@ pub enum QueueError {
     JobFailed(String),
     QueueFull { depth: u64, hard_threshold: u64 },
     InvalidConfig(String),
+    InvalidCron(String),
 }
 
 impl fmt::Display for QueueError {
@@ -31,6 +32,7 @@ impl fmt::Display for QueueError {
                 "queue full: depth {depth} >= hard_threshold {hard_threshold}"
             ),
             QueueError::InvalidConfig(msg) => write!(f, "invalid config: {msg}"),
+            QueueError::InvalidCron(msg) => write!(f, "invalid cron: {msg}"),
         }
     }
 }
