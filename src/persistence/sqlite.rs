@@ -13,6 +13,12 @@ pub struct SqliteJobRepository {
 impl SqliteJobRepository {
     pub fn new(db_path: &str) -> Result<Self, QueueError> {
         let conn = Connection::open(db_path)?;
+        // WAL keeps readers unblocked during writes and lets the scheduler
+        // connection coexist with the worker connection on the same file
+        // without SQLITE_BUSY under contention. `:memory:` silently stays in
+        // memory-journal mode. busy_timeout gives writers a short spin before
+        // erroring out in any mode.
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS jobs (
                 id TEXT PRIMARY KEY,
