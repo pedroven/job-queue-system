@@ -12,6 +12,7 @@ pub enum QueueError {
     QueueFull { depth: u64, hard_threshold: u64 },
     InvalidConfig(String),
     InvalidCron(String),
+    CannotCancel { id: String, status: String },
 }
 
 impl fmt::Display for QueueError {
@@ -33,6 +34,9 @@ impl fmt::Display for QueueError {
             ),
             QueueError::InvalidConfig(msg) => write!(f, "invalid config: {msg}"),
             QueueError::InvalidCron(msg) => write!(f, "invalid cron: {msg}"),
+            QueueError::CannotCancel { id, status } => {
+                write!(f, "cannot cancel job {id} in status {status}")
+            }
         }
     }
 }
