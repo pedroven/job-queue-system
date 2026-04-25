@@ -1,4 +1,4 @@
-use rusqlite::{Connection, ErrorCode};
+use rusqlite::{Connection, ErrorCode, OptionalExtension};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -282,13 +282,22 @@ impl JobRepository for SqliteJobRepository {
 
     fn update_status(&self, job_id: &str, status: JobStatus) -> Result<(), QueueError> {
         let conn = self.conn.lock()?;
+        // `Cancelled` is sticky: once set, no later transition (Running,
+        // Completed, Failed) may overwrite it. Closes the cancel/worker race
+        // — the worker's status writes are silently dropped if cancel won.
         let rows = conn.execute(
-            "UPDATE jobs SET status = ?1 WHERE id = ?2",
+            "UPDATE jobs SET status = ?1 WHERE id = ?2 AND status != 'cancelled'",
             (status.as_str(), job_id),
         )?;
 
         if rows == 0 {
-            return Err(QueueError::NotFound(job_id.to_string()));
+            let exists: bool = conn
+                .query_row("SELECT 1 FROM jobs WHERE id = ?1", [job_id], |_| Ok(true))
+                .optional()?
+                .unwrap_or(false);
+            if !exists {
+                return Err(QueueError::NotFound(job_id.to_string()));
+            }
         }
         Ok(())
     }
@@ -426,6 +435,29 @@ mod tests {
         let repo = SqliteJobRepository::new(":memory:").unwrap();
         let result = repo.find_by_id("nonexistent");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_sqlite_cancelled_status_is_sticky() {
+        let repo = SqliteJobRepository::new(":memory:").unwrap();
+        repo.save(&make_test_job("job-1", "payload")).unwrap();
+        repo.update_status("job-1", JobStatus::Cancelled).unwrap();
+
+        repo.update_status("job-1", JobStatus::Running).unwrap();
+        repo.update_status("job-1", JobStatus::Completed).unwrap();
+        repo.update_status("job-1", JobStatus::Failed).unwrap();
+
+        assert_eq!(
+            repo.find_by_id("job-1").unwrap().status,
+            JobStatus::Cancelled
+        );
+    }
+
+    #[test]
+    fn test_sqlite_update_status_missing_after_guard_still_returns_not_found() {
+        let repo = SqliteJobRepository::new(":memory:").unwrap();
+        let result = repo.update_status("nope", JobStatus::Running);
+        assert!(matches!(result, Err(QueueError::NotFound(_))));
     }
 
     #[test]

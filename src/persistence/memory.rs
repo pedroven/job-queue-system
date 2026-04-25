@@ -72,7 +72,10 @@ impl JobRepository for InMemoryJobRepository {
             .iter_mut()
             .find(|j| j.id == job_id)
             .ok_or_else(|| QueueError::NotFound(job_id.to_string()))?;
-        job.status = status;
+        // Cancelled is sticky — see SqliteJobRepository::update_status.
+        if job.status != JobStatus::Cancelled {
+            job.status = status;
+        }
         Ok(())
     }
 
@@ -186,6 +189,22 @@ mod tests {
         repo.update_status("job-3", JobStatus::Completed).unwrap();
 
         assert_eq!(repo.pending_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_in_memory_cancelled_status_is_sticky() {
+        let repo = InMemoryJobRepository::new();
+        repo.save(&make_test_job("job-1", "payload")).unwrap();
+        repo.update_status("job-1", JobStatus::Cancelled).unwrap();
+
+        repo.update_status("job-1", JobStatus::Running).unwrap();
+        repo.update_status("job-1", JobStatus::Completed).unwrap();
+        repo.update_status("job-1", JobStatus::Failed).unwrap();
+
+        assert_eq!(
+            repo.find_by_id("job-1").unwrap().status,
+            JobStatus::Cancelled
+        );
     }
 
     #[test]
