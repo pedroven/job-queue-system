@@ -305,3 +305,135 @@ fn test_retry_count_is_persisted() {
     let dl = repo.find_all_dead_letter().unwrap();
     assert_eq!(dl.len(), 0);
 }
+
+#[test]
+fn test_cancel_pending_marks_status_and_removes_from_queue() {
+    let repo = Arc::new(InMemoryJobRepository::new());
+    let queue = Queue::new(0, repo.clone(), default_registry()).unwrap();
+    queue.enqueue(make_test_job("job-1", "payload")).unwrap();
+
+    queue.cancel("job-1").unwrap();
+
+    let (lock, _) = &*queue.jobs;
+    assert_eq!(lock.lock().unwrap().len(), 0);
+    assert_eq!(
+        repo.find_by_id("job-1").unwrap().status,
+        models::JobStatus::Cancelled
+    );
+}
+
+#[test]
+fn test_cancel_running_marks_status() {
+    let repo = Arc::new(InMemoryJobRepository::new());
+    let queue = Queue::new(0, repo.clone(), default_registry()).unwrap();
+    let mut job = make_test_job("job-1", "payload");
+    job.status = models::JobStatus::Running;
+    repo.save(&job).unwrap();
+
+    queue.cancel("job-1").unwrap();
+
+    assert_eq!(
+        repo.find_by_id("job-1").unwrap().status,
+        models::JobStatus::Cancelled
+    );
+}
+
+#[test]
+fn test_cancel_terminal_returns_cannot_cancel() {
+    let repo = Arc::new(InMemoryJobRepository::new());
+    let queue = Queue::new(0, repo.clone(), default_registry()).unwrap();
+    repo.save(&make_test_job("job-1", "payload")).unwrap();
+    repo.update_status("job-1", models::JobStatus::Completed)
+        .unwrap();
+
+    let err = queue.cancel("job-1").unwrap_err();
+    assert!(matches!(err, QueueError::CannotCancel { .. }));
+}
+
+#[test]
+fn test_cancel_unknown_job_returns_not_found() {
+    let queue = create_queue(0);
+    let err = queue.cancel("nope").unwrap_err();
+    assert!(matches!(err, QueueError::NotFound(_)));
+}
+
+#[test]
+fn test_handle_job_tries_bails_after_cancel_between_attempts() {
+    // A consumer that always fails. After the first attempt, the test cancels
+    // the job; the loop must skip remaining attempts (no DLQ entry, retry
+    // count stays at 1).
+    struct CancelOnFirstFailure {
+        repo: Arc<dyn JobRepository>,
+        cancelled: Mutex<bool>,
+    }
+    impl Consumer for CancelOnFirstFailure {
+        fn consume(&self, job: &Job) -> Result<(), QueueError> {
+            let mut done = self.cancelled.lock().unwrap();
+            if !*done {
+                *done = true;
+                self.repo
+                    .update_status(&job.id, models::JobStatus::Cancelled)
+                    .unwrap();
+            }
+            Err(QueueError::JobFailed("simulated".to_string()))
+        }
+    }
+
+    let repo: Arc<dyn JobRepository> = Arc::new(InMemoryJobRepository::new());
+    let queue = create_queue_with_repo(repo.clone());
+    let mut job = make_test_job("job-1", "payload");
+    job.max_attempts = 10;
+    repo.save(&job).unwrap();
+
+    let consumer = CancelOnFirstFailure {
+        repo: repo.clone(),
+        cancelled: Mutex::new(false),
+    };
+    worker::handle_job_tries(&queue, &consumer, job, Duration::ZERO).unwrap();
+
+    let persisted = repo.find_by_id("job-1").unwrap();
+    assert_eq!(persisted.status, models::JobStatus::Cancelled);
+    assert_eq!(persisted.retry_count, 1, "should not retry past cancel");
+    assert_eq!(repo.find_all_dead_letter().unwrap().len(), 0);
+}
+
+#[test]
+fn test_metrics_reporter_handle_stop_terminates_thread() {
+    let queue = Arc::new(create_queue(0));
+    // Long interval — if stop() didn't work, this test would hang well past
+    // its time budget waiting for the loop to wake on its own.
+    let handle = queue.start_metrics_reporter(Duration::from_secs(60));
+    let start = std::time::Instant::now();
+    handle.stop();
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "stop() must wake the reporter via cvar, not wait out the interval",
+    );
+}
+
+#[test]
+fn test_process_job_skips_when_already_cancelled() {
+    // Pre-marks the job Cancelled before process_job runs — the easy case
+    // (no race). The narrow window where cancel() arrives between worker.rs's
+    // find_by_id and update_status(Running) is not covered here; the
+    // repository's sticky-Cancelled guard is what protects that race.
+    let repo = Arc::new(InMemoryJobRepository::new());
+    let queue = create_queue_with_repo(repo.clone());
+    let job = make_test_job("job-1", "payload");
+    repo.save(&job).unwrap();
+    repo.update_status("job-1", models::JobStatus::Cancelled)
+        .unwrap();
+
+    let worker_mutex = Mutex::new(Worker {
+        id: "worker-0".to_string(),
+        status: WorkerStatus::Idle,
+        current_job_id: None,
+    });
+    let consumer = consumer::JobConsumer;
+    worker::process_job(&worker_mutex, &consumer, job, &queue);
+
+    assert_eq!(
+        repo.find_by_id("job-1").unwrap().status,
+        models::JobStatus::Cancelled
+    );
+}
