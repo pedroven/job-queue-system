@@ -1,5 +1,7 @@
 use std::fmt;
 
+use crate::models::JobStatus;
+
 #[derive(Debug)]
 pub enum QueueError {
     Sqlite(rusqlite::Error),
@@ -12,7 +14,7 @@ pub enum QueueError {
     QueueFull { depth: u64, hard_threshold: u64 },
     InvalidConfig(String),
     InvalidCron(String),
-    CannotCancel { id: String, status: String },
+    CannotCancel { id: String, status: JobStatus },
 }
 
 impl fmt::Display for QueueError {
