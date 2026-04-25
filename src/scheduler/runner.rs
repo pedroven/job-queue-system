@@ -14,10 +14,7 @@ pub struct Scheduler {
 }
 
 impl Scheduler {
-    pub fn new(
-        repo: Arc<dyn ScheduledJobRepository>,
-        producer: Arc<dyn Producer>,
-    ) -> Self {
+    pub fn new(repo: Arc<dyn ScheduledJobRepository>, producer: Arc<dyn Producer>) -> Self {
         Self { repo, producer }
     }
 
