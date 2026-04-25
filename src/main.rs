@@ -41,6 +41,7 @@ fn main() {
             .expect("Failed to initialize queue"),
     );
     queue.start_workers();
+    let _metrics_handle = queue.start_metrics_reporter(Duration::from_secs(10));
     task::set_global_queue(Arc::clone(&queue)).expect("global queue already installed");
 
     let scheduled_repo: Arc<dyn ScheduledJobRepository> = Arc::new(

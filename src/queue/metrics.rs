@@ -1,3 +1,4 @@
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -6,19 +7,39 @@ use crate::models::WorkerStatus;
 /// Atomic counters incremented by workers as jobs finalize. Held inside the
 /// `Queue` so any thread can update them without taking a lock.
 pub(crate) struct MetricsCounters {
-    pub completed: AtomicU64,
-    pub failed_attempts: AtomicU64,
-    pub dead_lettered: AtomicU64,
-    pub started_at: Instant,
+    completed: AtomicU64,
+    failed_attempts: AtomicU64,
+    dead_lettered: AtomicU64,
+    started_at: Instant,
+    /// Latest EWMA-smoothed throughput (finalized jobs/sec). Updated only by
+    /// `tick_throughput`; readers see whatever the last tick wrote.
+    throughput_ewma: Mutex<EwmaState>,
 }
+
+struct EwmaState {
+    last_tick: Instant,
+    last_finalized: u64,
+    rate: f64,
+}
+
+/// Time constant for the throughput EWMA. With dt ≈ tick interval, this gives
+/// roughly a 1-minute responsiveness window (older samples decay to ~37% in
+/// `TAU` seconds).
+const THROUGHPUT_TAU: Duration = Duration::from_secs(60);
 
 impl Default for MetricsCounters {
     fn default() -> Self {
+        let now = Instant::now();
         Self {
             completed: AtomicU64::new(0),
             failed_attempts: AtomicU64::new(0),
             dead_lettered: AtomicU64::new(0),
-            started_at: Instant::now(),
+            started_at: now,
+            throughput_ewma: Mutex::new(EwmaState {
+                last_tick: now,
+                last_finalized: 0,
+                rate: 0.0,
+            }),
         }
     }
 }
@@ -28,12 +49,46 @@ impl MetricsCounters {
         self.completed.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Counts each *failed attempt*, not failed jobs — a job that succeeds on
+    /// retry 3 contributes 2 here. The DLQ counter (`record_dead_lettered`)
+    /// is what corresponds to "jobs that ultimately failed".
     pub(crate) fn record_failed_attempt(&self) {
         self.failed_attempts.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_dead_lettered(&self) {
         self.dead_lettered.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Sample the current finalized count and fold it into the EWMA. Intended
+    /// to be called from the reporter loop on a fixed cadence so the EWMA's
+    /// effective time constant is stable. Ad-hoc snapshot readers should not
+    /// call this — jittery `dt` between calls produces noisy estimates.
+    pub(crate) fn tick_throughput(&self) {
+        let mut state = self
+            .throughput_ewma
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        let dt = now.duration_since(state.last_tick).as_secs_f64();
+        if dt <= 0.0 {
+            return;
+        }
+        let finalized =
+            self.completed.load(Ordering::Relaxed) + self.dead_lettered.load(Ordering::Relaxed);
+        let delta = finalized.saturating_sub(state.last_finalized) as f64;
+        let instantaneous = delta / dt;
+        let alpha = 1.0 - (-dt / THROUGHPUT_TAU.as_secs_f64()).exp();
+        state.rate = alpha * instantaneous + (1.0 - alpha) * state.rate;
+        state.last_tick = now;
+        state.last_finalized = finalized;
+    }
+
+    fn current_throughput(&self) -> f64 {
+        self.throughput_ewma
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .rate
     }
 }
 
@@ -45,10 +100,14 @@ pub struct MetricsSnapshot {
     pub idle_workers: u64,
     pub busy_workers: u64,
     pub completed_total: u64,
+    /// Number of failed *attempts*, not failed jobs. A job that succeeds on
+    /// retry 3 contributes 2 here. See `dead_lettered_total` for jobs that
+    /// ultimately failed.
     pub failed_attempts_total: u64,
     pub dead_lettered_total: u64,
     pub uptime: Duration,
-    /// Finalized jobs per second since startup (completed + dead-lettered).
+    /// EWMA of finalized jobs per second (completed + dead-lettered), updated
+    /// by the reporter tick. `0.0` until the first tick after startup.
     pub throughput_per_sec: f64,
     /// Fraction of finalized jobs that ended in the DLQ. `0.0` when no jobs
     /// have finalized yet.
@@ -98,14 +157,7 @@ pub(crate) fn build_snapshot(
     let failed_attempts = counters.failed_attempts.load(Ordering::Relaxed);
     let dead_lettered = counters.dead_lettered.load(Ordering::Relaxed);
     let uptime = counters.started_at.elapsed();
-
-    let secs = uptime.as_secs_f64();
     let finalized = completed + dead_lettered;
-    let throughput_per_sec = if secs > 0.0 {
-        finalized as f64 / secs
-    } else {
-        0.0
-    };
     let failure_rate = if finalized > 0 {
         dead_lettered as f64 / finalized as f64
     } else {
@@ -122,7 +174,7 @@ pub(crate) fn build_snapshot(
         failed_attempts_total: failed_attempts,
         dead_lettered_total: dead_lettered,
         uptime,
-        throughput_per_sec,
+        throughput_per_sec: counters.current_throughput(),
         failure_rate,
     }
 }
@@ -140,6 +192,7 @@ mod tests {
         assert_eq!(snap.dead_lettered_total, 0);
         assert_eq!(snap.failure_rate, 0.0);
         assert_eq!(snap.worker_count, 0);
+        assert_eq!(snap.throughput_per_sec, 0.0);
     }
 
     #[test]
@@ -182,5 +235,30 @@ mod tests {
         assert!(s.contains("depth=5"));
         assert!(s.contains("workers=1"));
         assert!(s.contains("completed=1"));
+    }
+
+    #[test]
+    fn throughput_ewma_rises_with_activity_then_decays() {
+        let counters = MetricsCounters::default();
+        // Backdate last_tick so dt is non-trivial without sleeping.
+        {
+            let mut state = counters.throughput_ewma.lock().unwrap();
+            state.last_tick = Instant::now() - Duration::from_secs(10);
+        }
+        for _ in 0..50 {
+            counters.record_completed();
+        }
+        counters.tick_throughput();
+        let after_burst = counters.current_throughput();
+        assert!(after_burst > 0.0, "EWMA should rise after a burst");
+
+        // No more activity; another tick after some elapsed time should pull
+        // the EWMA toward zero.
+        {
+            let mut state = counters.throughput_ewma.lock().unwrap();
+            state.last_tick = Instant::now() - Duration::from_secs(60);
+        }
+        counters.tick_throughput();
+        assert!(counters.current_throughput() < after_burst);
     }
 }
