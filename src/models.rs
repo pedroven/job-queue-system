@@ -9,6 +9,7 @@ pub enum JobStatus {
     Running,
     Completed,
     Failed,
+    Cancelled,
 }
 
 impl JobStatus {
@@ -18,6 +19,7 @@ impl JobStatus {
             JobStatus::Running => "running",
             JobStatus::Completed => "completed",
             JobStatus::Failed => "failed",
+            JobStatus::Cancelled => "cancelled",
         }
     }
 }
@@ -37,6 +39,7 @@ impl std::str::FromStr for JobStatus {
             "running" => Ok(JobStatus::Running),
             "completed" => Ok(JobStatus::Completed),
             "failed" => Ok(JobStatus::Failed),
+            "cancelled" => Ok(JobStatus::Cancelled),
             _ => Err(QueueError::InvalidStatus(s.to_string())),
         }
     }
@@ -106,7 +109,7 @@ pub struct TaskRecord {
     pub payload: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkerStatus {
     Idle,
     Busy,
