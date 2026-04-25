@@ -27,6 +27,15 @@ impl JobQueues {
         self.levels.entry(level).or_default().push_back(job);
     }
 
+    pub(crate) fn remove(&mut self, job_id: &str) -> Option<Job> {
+        for queue in self.levels.values_mut() {
+            if let Some(idx) = queue.iter().position(|j| j.id == job_id) {
+                return queue.remove(idx);
+            }
+        }
+        None
+    }
+
     pub(crate) fn pop_next(&mut self) -> Option<Job> {
         // BTreeMap iterates in ascending key order; reverse for highest-first.
         for queue in self.levels.values_mut().rev() {

@@ -1,15 +1,17 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use crate::consumer::RegistryConsumer;
 use crate::error::QueueError;
-use crate::models::{DeadLetterJob, Job, JobPriority, Worker, WorkerStatus};
+use crate::models::{DeadLetterJob, Job, JobPriority, JobStatus, Worker, WorkerStatus};
 use crate::persistence::JobRepository;
 use crate::task::{TaskRegistry, generate_job_id};
 
 use super::config::QueueConfig;
 use super::levels::JobQueues;
+use super::metrics::{self, MetricsCounters, MetricsSnapshot};
 use super::worker;
 
 pub struct Queue {
@@ -19,6 +21,7 @@ pub struct Queue {
     pub(crate) job_repository: Arc<dyn JobRepository>,
     pub(crate) registry: Arc<TaskRegistry>,
     pub(crate) config: QueueConfig,
+    pub(crate) metrics: Arc<MetricsCounters>,
 }
 
 impl Queue {
@@ -69,7 +72,56 @@ impl Queue {
             job_repository,
             registry: Arc::new(registry),
             config,
+            metrics: Arc::new(MetricsCounters::default()),
         })
+    }
+
+    pub fn metrics_snapshot(&self) -> MetricsSnapshot {
+        let queue_depth = self.len() as u64;
+        let dead_letter_depth = {
+            let dl = self
+                .dead_letter_jobs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            dl.len() as u64
+        };
+        let statuses = self.workers.iter().map(|w| {
+            let guard = w.lock().unwrap_or_else(|e| e.into_inner());
+            guard.status
+        });
+        metrics::build_snapshot(&self.metrics, queue_depth, dead_letter_depth, statuses)
+    }
+
+    /// Spawn a background thread that ticks the throughput EWMA and prints a
+    /// metrics snapshot at the given interval. Drop or call
+    /// `MetricsReporterHandle::stop` to terminate cleanly — the loop wakes
+    /// promptly via the cvar instead of waiting out the next sleep.
+    pub fn start_metrics_reporter(self: &Arc<Self>, interval: Duration) -> MetricsReporterHandle {
+        let queue = Arc::clone(self);
+        let stop = Arc::new((Mutex::new(false), Condvar::new()));
+        let stop_for_thread = Arc::clone(&stop);
+        let join = thread::spawn(move || {
+            let (lock, cvar) = &*stop_for_thread;
+            loop {
+                let stopped_guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+                if *stopped_guard {
+                    return;
+                }
+                let (stopped_guard, _timeout) = cvar
+                    .wait_timeout(stopped_guard, interval)
+                    .unwrap_or_else(|e| e.into_inner());
+                if *stopped_guard {
+                    return;
+                }
+                drop(stopped_guard);
+                queue.metrics.tick_throughput();
+                println!("[metrics] {}", queue.metrics_snapshot().render());
+            }
+        });
+        MetricsReporterHandle {
+            stop,
+            join: Some(join),
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -146,6 +198,35 @@ impl Queue {
         self.enqueue(job)
     }
 
+    /// Cancel a job by id.
+    ///
+    /// - `Pending`: removed from the in-memory level and marked `Cancelled`.
+    /// - `Running`: marked `Cancelled`. An in-flight consumer call is not
+    ///   preempted and may still produce a result, but the repository's
+    ///   sticky-Cancelled guard rejects any subsequent status write — so the
+    ///   DB always reflects `Cancelled` once `cancel()` returns Ok.
+    /// - Terminal states (`Completed`/`Failed`/`Cancelled`): returns
+    ///   `CannotCancel` so callers can distinguish a no-op from success.
+    pub fn cancel(&self, job_id: &str) -> Result<(), QueueError> {
+        let job = self.job_repository.find_by_id(job_id)?;
+        match job.status {
+            JobStatus::Pending => {
+                let (lock, _) = &*self.jobs;
+                let mut jobs = lock.lock()?;
+                jobs.remove(job_id);
+            }
+            JobStatus::Running => {}
+            terminal => {
+                return Err(QueueError::CannotCancel {
+                    id: job_id.to_string(),
+                    status: terminal,
+                });
+            }
+        }
+        self.job_repository
+            .update_status(job_id, JobStatus::Cancelled)
+    }
+
     pub fn start_workers(self: &Arc<Self>) {
         for worker in &self.workers {
             let consumer = RegistryConsumer::new(Arc::clone(&self.registry));
@@ -169,6 +250,37 @@ impl Queue {
             jobs = cvar.wait(jobs).unwrap_or_else(|e| e.into_inner());
         }
         jobs.pop_next()
+    }
+}
+
+/// Owns the metrics reporter thread. Drop signals the thread to stop; an
+/// explicit `stop()` does the same and joins, surfacing any panic.
+pub struct MetricsReporterHandle {
+    stop: Arc<(Mutex<bool>, Condvar)>,
+    join: Option<thread::JoinHandle<()>>,
+}
+
+impl MetricsReporterHandle {
+    pub fn stop(mut self) {
+        self.signal_stop();
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+
+    fn signal_stop(&self) {
+        let (lock, cvar) = &*self.stop;
+        let mut stopped = lock.lock().unwrap_or_else(|e| e.into_inner());
+        *stopped = true;
+        cvar.notify_all();
+    }
+}
+
+impl Drop for MetricsReporterHandle {
+    fn drop(&mut self) {
+        if self.join.is_some() {
+            self.signal_stop();
+        }
     }
 }
 
