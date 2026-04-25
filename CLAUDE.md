@@ -22,7 +22,7 @@ cargo clippy
 
 - `src/main.rs` — Entry point. Creates the queue, starts workers, and reads payloads from stdin in a loop.
 - `src/lib.rs` — Crate root. Declares modules and re-exports (`QueueError`, `#[task]` macro).
-- `src/queue.rs` + `src/queue/` — module root declares submodules and re-exports. `queue/core.rs` holds the `Queue` struct (workers, enqueueing, dispatch via `Mutex`/`Condvar`) with tests in `queue/core/tests.rs`, `queue/config.rs` the `QueueConfig` + validation, `queue/levels.rs` the `JobQueues` priority-keyed staging, `queue/worker.rs` the worker `process_job` / `handle_job_tries` helpers.
+- `src/queue.rs` + `src/queue/` — module root declares submodules and re-exports. `queue/core.rs` holds the `Queue` struct (workers, enqueueing, dispatch via `Mutex`/`Condvar`) with tests in `queue/core/tests.rs`, `queue/config.rs` the `QueueConfig` + validation, `queue/levels.rs` the `JobQueues` priority-keyed staging, `queue/worker.rs` the worker `process_job` / `handle_job_tries` helpers, `queue/metrics.rs` the `MetricsCounters` + `MetricsSnapshot` (queue depth, DLQ depth, worker counts, completed/failed/dead-lettered totals, throughput, failure rate) consumed by `Queue::metrics_snapshot` and `Queue::start_metrics_reporter`.
 - `src/models.rs` — Data models: `Job`, `TaskRecord`, `Worker`, `DeadLetterJob`, and their status enums.
 - `src/producer.rs` — `Producer` trait and `JobProducer` implementation that enqueues jobs.
 - `src/consumer.rs` — `Consumer` trait and `JobConsumer` implementation that processes jobs.
