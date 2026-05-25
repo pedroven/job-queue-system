@@ -17,8 +17,15 @@ impl SqliteJobRepository {
         // connection coexist with the worker connection on the same file
         // without SQLITE_BUSY under contention. `:memory:` silently stays in
         // memory-journal mode. busy_timeout gives writers a short spin before
-        // erroring out in any mode.
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")?;
+        // erroring out in any mode. synchronous=NORMAL skips the per-commit
+        // fsync of the WAL — commits still hit the OS page cache (durable
+        // across process crashes) but only get flushed to disk at checkpoint.
+        // Tradeoff: a host power loss can drop the tail of recently-committed
+        // jobs. Acceptable for a job queue that already assumes at-least-once
+        // delivery; same default Redis/AOF-backed queues run with.
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;",
+        )?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS jobs (
                 id TEXT PRIMARY KEY,
