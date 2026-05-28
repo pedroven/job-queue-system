@@ -184,7 +184,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn snapshot_with_no_activity_is_zeroed() {
+    fn test_snapshot_with_no_activity_is_zeroed() {
         let counters = MetricsCounters::default();
         let snap = build_snapshot(&counters, 0, 0, std::iter::empty());
         assert_eq!(snap.queue_depth, 0);
@@ -196,7 +196,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_aggregates_worker_statuses() {
+    fn test_snapshot_aggregates_worker_statuses() {
         let counters = MetricsCounters::default();
         let statuses = [
             WorkerStatus::Idle,
@@ -213,7 +213,7 @@ mod tests {
     }
 
     #[test]
-    fn failure_rate_uses_finalized_total() {
+    fn test_failure_rate_uses_finalized_total() {
         let counters = MetricsCounters::default();
         for _ in 0..3 {
             counters.record_completed();
@@ -227,7 +227,7 @@ mod tests {
     }
 
     #[test]
-    fn render_includes_key_fields() {
+    fn test_render_includes_key_fields() {
         let counters = MetricsCounters::default();
         counters.record_completed();
         let snap = build_snapshot(&counters, 5, 0, [WorkerStatus::Idle]);
@@ -238,7 +238,7 @@ mod tests {
     }
 
     #[test]
-    fn throughput_ewma_rises_with_activity_then_decays() {
+    fn test_throughput_ewma_rises_with_activity_then_decays() {
         let counters = MetricsCounters::default();
         // Backdate last_tick so dt is non-trivial without sleeping.
         {

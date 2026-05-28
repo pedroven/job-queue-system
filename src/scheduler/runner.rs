@@ -6,16 +6,26 @@ use crate::error::QueueError;
 use crate::models::Job;
 use crate::producer::Producer;
 
+use super::lease::SchedulerLease;
 use super::model::{ScheduledJob, ScheduledJobRepository, next_fire_after};
 
 pub struct Scheduler {
     repo: Arc<dyn ScheduledJobRepository>,
     producer: Arc<dyn Producer>,
+    lease: Arc<dyn SchedulerLease>,
 }
 
 impl Scheduler {
-    pub fn new(repo: Arc<dyn ScheduledJobRepository>, producer: Arc<dyn Producer>) -> Self {
-        Self { repo, producer }
+    pub fn new(
+        repo: Arc<dyn ScheduledJobRepository>,
+        producer: Arc<dyn Producer>,
+        lease: Arc<dyn SchedulerLease>,
+    ) -> Self {
+        Self {
+            repo,
+            producer,
+            lease,
+        }
     }
 
     /// Spawns the scheduler thread. The thread wakes every `tick_interval` and
@@ -71,6 +81,11 @@ impl Scheduler {
     /// - Per-row isolation: a failing row logs and is skipped; the rest of
     ///   the due batch still fires this tick.
     pub fn tick(&self, now: SystemTime) -> Result<usize, QueueError> {
+        // Only the lease holder fires. Other hosts' schedulers tick but
+        // return early — `try_acquire` is cheap (one Redis round-trip).
+        if !self.lease.try_acquire()? {
+            return Ok(0);
+        }
         let due = self.repo.find_due(now)?;
 
         let mut fired = 0;

@@ -1,18 +1,5 @@
 //! Throughput NFR: ≥1,000 job submissions per second through `JobProducer`
-//! against `SqliteJobRepository` (the production backend).
-//!
-//! Marked `#[ignore]` because:
-//! - The measurement is meaningful only in `--release`.
-//! - It depends on disk fsync rate, so it's environment-sensitive.
-//!
-//! Run with:
-//!   cargo test --release --test nfr_throughput -- --ignored --nocapture
-//!
-//! If this fails by a small margin, the first thing to try is adding
-//! `PRAGMA synchronous=NORMAL` alongside the existing WAL pragma in
-//! `src/persistence/sqlite.rs` — WAL+NORMAL is durable enough for a job
-//! queue (no torn writes, only a tiny window of "committed but not yet
-//! persisted" on power loss) and typically multiplies fsync throughput.
+//! against `SqliteJobDispatch` + `SqliteJobState`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -20,13 +7,11 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use job_queue_system::models::Job;
-use job_queue_system::persistence::{JobRepository, SqliteJobRepository};
+use job_queue_system::persistence::{JobDispatch, JobState, SqliteJobDispatch, SqliteJobState};
 use job_queue_system::producer::{JobProducer, Producer};
 use job_queue_system::queue::{Queue, QueueConfig};
 use job_queue_system::task::TaskRegistry;
 
-/// Owns a SQLite file path and removes it (plus its WAL/SHM siblings) on
-/// drop, so a failed assertion doesn't leak files into the temp dir.
 struct TempDb {
     path: PathBuf,
 }
@@ -62,27 +47,26 @@ impl Drop for TempDb {
 #[test]
 #[ignore = "throughput NFR; run with `cargo test --release -- --ignored`"]
 fn nfr_submissions_per_second_at_least_1000() {
-    // 8 producers × 1500 jobs = 12,000 submissions. At the 1k/s floor that
-    // finishes in ~12s; well under the default test timeout.
     const PRODUCERS: usize = 8;
     const PER_PRODUCER: usize = 1500;
     const TOTAL: usize = PRODUCERS * PER_PRODUCER;
 
     let db = TempDb::new("throughput");
-    let repo: Arc<dyn JobRepository> =
-        Arc::new(SqliteJobRepository::new(db.as_str()).expect("open sqlite"));
+    let dispatch: Arc<dyn JobDispatch> =
+        Arc::new(SqliteJobDispatch::new(db.as_str(), 1).expect("open sqlite dispatch"));
+    let state: Arc<dyn JobState> =
+        Arc::new(SqliteJobState::new(db.as_str()).expect("open sqlite state"));
 
-    // Thresholds well above TOTAL so back-pressure never kicks in — this
-    // bench isolates raw submission cost, not throttle behavior.
     let ceiling = (TOTAL as u64) * 2;
     let config = QueueConfig {
         backpressure_soft_threshold: ceiling,
         backpressure_hard_threshold: ceiling,
         backpressure_delay: Duration::from_millis(0),
+        assigned_partitions: vec![],
         ..QueueConfig::default()
     };
     let queue = Arc::new(
-        Queue::with_config(0, Arc::clone(&repo), TaskRegistry::new(), config)
+        Queue::with_config(dispatch, Arc::clone(&state), TaskRegistry::new(), config)
             .expect("queue init"),
     );
 
@@ -115,9 +99,8 @@ fn nfr_submissions_per_second_at_least_1000() {
         elapsed.as_secs_f64(),
     );
 
-    // Sanity: every submission must have landed in the repo.
     assert_eq!(
-        repo.pending_count().expect("pending_count"),
+        queue.pending_count().expect("pending_count"),
         TOTAL as u64,
         "not all submissions persisted",
     );

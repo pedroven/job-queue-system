@@ -45,34 +45,34 @@ mod tests {
     use super::*;
     use crate::models::JobStatus;
     use crate::models::testing::make_test_job;
-    use crate::persistence::{InMemoryJobRepository, JobRepository};
+    use crate::persistence::{InMemoryJobDispatch, InMemoryJobState, JobDispatch, JobState};
     use crate::queue::QueueConfig;
     use crate::task::TaskRegistry;
     use std::time::{Duration, Instant};
 
-    fn create_queue(num_workers: usize) -> Arc<Queue> {
-        create_queue_with(
-            num_workers,
-            Arc::new(InMemoryJobRepository::new()),
-            QueueConfig::default(),
-        )
+    fn no_worker_config() -> QueueConfig {
+        QueueConfig {
+            assigned_partitions: vec![],
+            ..QueueConfig::default()
+        }
     }
 
     fn create_queue_with_config(config: QueueConfig) -> Arc<Queue> {
-        create_queue_with(0, Arc::new(InMemoryJobRepository::new()), config)
+        let dispatch: Arc<dyn JobDispatch> =
+            Arc::new(InMemoryJobDispatch::new(config.partition_count));
+        let state: Arc<dyn JobState> = Arc::new(InMemoryJobState::new());
+        Arc::new(Queue::with_config(dispatch, state, TaskRegistry::new(), config).unwrap())
     }
 
-    fn create_queue_with(
-        num_workers: usize,
-        repo: Arc<dyn JobRepository>,
-        config: QueueConfig,
-    ) -> Arc<Queue> {
-        Arc::new(Queue::with_config(num_workers, repo, TaskRegistry::new(), config).unwrap())
+    fn create_queue_with_state(state: Arc<dyn JobState>, config: QueueConfig) -> Arc<Queue> {
+        let dispatch: Arc<dyn JobDispatch> =
+            Arc::new(InMemoryJobDispatch::new(config.partition_count));
+        Arc::new(Queue::with_config(dispatch, state, TaskRegistry::new(), config).unwrap())
     }
 
     #[test]
     fn test_produce_returns_ok() {
-        let queue = create_queue(0);
+        let queue = create_queue_with_config(no_worker_config());
         let producer = JobProducer::new(Arc::clone(&queue));
         let result = producer.produce(make_test_job("job-1", "payload"));
         assert!(result.is_ok());
@@ -80,12 +80,12 @@ mod tests {
 
     #[test]
     fn test_produce_enqueues_job() {
-        let queue = create_queue(0);
+        let queue = create_queue_with_config(no_worker_config());
         let producer = JobProducer::new(Arc::clone(&queue));
         producer.produce(make_test_job("job-1", "first")).unwrap();
         producer.produce(make_test_job("job-2", "second")).unwrap();
 
-        assert_eq!(queue.len(), 2);
+        assert_eq!(queue.pending_count().unwrap(), 2);
     }
 
     #[test]
@@ -98,13 +98,13 @@ mod tests {
             backpressure_soft_threshold: 10,
             backpressure_hard_threshold: 20,
             backpressure_delay: Duration::from_millis(200),
-            ..QueueConfig::default()
+            ..no_worker_config()
         };
         let queue = create_queue_with_config(config);
         let producer = JobProducer::new(Arc::clone(&queue));
 
         producer.produce(make_test_job("job-1", "payload")).unwrap();
-        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.pending_count().unwrap(), 1);
     }
 
     #[test]
@@ -113,7 +113,7 @@ mod tests {
             backpressure_soft_threshold: 2,
             backpressure_hard_threshold: 10,
             backpressure_delay: Duration::from_millis(80),
-            ..QueueConfig::default()
+            ..no_worker_config()
         };
         let queue = create_queue_with_config(config);
         let producer = JobProducer::new(Arc::clone(&queue));
@@ -128,7 +128,7 @@ mod tests {
             elapsed >= Duration::from_millis(80),
             "expected throttle sleep, took {elapsed:?}"
         );
-        assert_eq!(queue.len(), 3);
+        assert_eq!(queue.pending_count().unwrap(), 3);
     }
 
     #[test]
@@ -137,7 +137,7 @@ mod tests {
             backpressure_soft_threshold: 1,
             backpressure_hard_threshold: 2,
             backpressure_delay: Duration::from_millis(0),
-            ..QueueConfig::default()
+            ..no_worker_config()
         };
         let queue = create_queue_with_config(config);
         let producer = JobProducer::new(Arc::clone(&queue));
@@ -156,18 +156,15 @@ mod tests {
             }
             other => panic!("expected QueueFull, got {other:?}"),
         }
-        assert_eq!(queue.len(), 2);
+        assert_eq!(queue.pending_count().unwrap(), 2);
     }
 
     #[test]
     fn test_with_config_rejects_invalid_thresholds() {
         fn assert_invalid(config: QueueConfig) {
-            let result = Queue::with_config(
-                0,
-                Arc::new(InMemoryJobRepository::new()),
-                TaskRegistry::new(),
-                config,
-            );
+            let dispatch: Arc<dyn JobDispatch> = Arc::new(InMemoryJobDispatch::new(1));
+            let state: Arc<dyn JobState> = Arc::new(InMemoryJobState::new());
+            let result = Queue::with_config(dispatch, state, TaskRegistry::new(), config);
             match result {
                 Err(QueueError::InvalidConfig(_)) => {}
                 Err(other) => panic!("expected InvalidConfig, got {other:?}"),
@@ -178,34 +175,49 @@ mod tests {
         assert_invalid(QueueConfig {
             backpressure_soft_threshold: 10,
             backpressure_hard_threshold: 5,
-            ..QueueConfig::default()
+            ..no_worker_config()
         });
         assert_invalid(QueueConfig {
             backpressure_soft_threshold: 0,
             backpressure_hard_threshold: 0,
-            ..QueueConfig::default()
+            ..no_worker_config()
         });
     }
 
     #[test]
     fn test_produce_recovers_when_depth_drops() {
-        let repo = Arc::new(InMemoryJobRepository::new());
+        // Drain-via-dispatch: after produce+claim, pending_count drops and a
+        // previously-rejected produce can succeed.
+        let state: Arc<dyn JobState> = Arc::new(InMemoryJobState::new());
         let config = QueueConfig {
             backpressure_soft_threshold: 1,
             backpressure_hard_threshold: 2,
             backpressure_delay: Duration::from_millis(0),
-            ..QueueConfig::default()
+            ..no_worker_config()
         };
-        let queue = create_queue_with(0, Arc::clone(&repo) as Arc<dyn JobRepository>, config);
+        let queue = create_queue_with_state(Arc::clone(&state), config);
         let producer = JobProducer::new(Arc::clone(&queue));
 
         producer.produce(make_test_job("job-1", "p")).unwrap();
         producer.produce(make_test_job("job-2", "p")).unwrap();
         assert!(producer.produce(make_test_job("job-3", "p")).is_err());
 
-        // Simulate workers draining: flip persisted statuses away from Pending.
-        repo.update_status("job-1", JobStatus::Completed).unwrap();
-        repo.update_status("job-2", JobStatus::Completed).unwrap();
+        // Drain by claiming + acking via the dispatch directly. State stays
+        // around but the pending stream shrinks → back-pressure clears.
+        let c1 = queue
+            .dispatch
+            .next_for_partition(0, "c", Duration::from_millis(20))
+            .unwrap()
+            .unwrap();
+        state.save_status(&c1.job.id, JobStatus::Completed).unwrap();
+        queue.dispatch.ack(0, &c1).unwrap();
+        let c2 = queue
+            .dispatch
+            .next_for_partition(0, "c", Duration::from_millis(20))
+            .unwrap()
+            .unwrap();
+        state.save_status(&c2.job.id, JobStatus::Completed).unwrap();
+        queue.dispatch.ack(0, &c2).unwrap();
 
         assert!(producer.produce(make_test_job("job-3", "p")).is_ok());
     }

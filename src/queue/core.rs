@@ -1,90 +1,81 @@
-use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use crate::consumer::RegistryConsumer;
 use crate::error::QueueError;
-use crate::models::{DeadLetterJob, Job, JobPriority, JobStatus, Worker, WorkerStatus};
-use crate::persistence::JobRepository;
+use crate::models::{Job, JobPriority, JobStatus, Worker, WorkerStatus};
+use crate::persistence::{JobDispatch, JobState};
 use crate::task::{TaskRegistry, generate_job_id};
 
 use super::config::QueueConfig;
-use super::levels::JobQueues;
 use super::metrics::{self, MetricsCounters, MetricsSnapshot};
+use super::partition;
+use super::reaper::{Reaper, ReaperThread};
 use super::worker;
 
+/// The queue. Owns dispatch (hot path) + state (slow path) + per-partition
+/// worker threads. There is no in-memory mirror — `dispatch` is the source
+/// of truth for routing.
 pub struct Queue {
     pub(crate) workers: Vec<Arc<Mutex<Worker>>>,
-    pub(crate) jobs: Arc<(Mutex<JobQueues>, Condvar)>,
-    pub(crate) dead_letter_jobs: Arc<Mutex<VecDeque<DeadLetterJob>>>,
-    pub(crate) job_repository: Arc<dyn JobRepository>,
+    pub(crate) dispatch: Arc<dyn JobDispatch>,
+    pub(crate) state: Arc<dyn JobState>,
     pub(crate) registry: Arc<TaskRegistry>,
     pub(crate) config: QueueConfig,
     pub(crate) metrics: Arc<MetricsCounters>,
+    /// Per-queue consumer identifier — included in Redis `XREADGROUP` so
+    /// the consumer group can attribute PEL entries to this process.
+    pub(crate) consumer_id: String,
 }
 
 impl Queue {
     pub fn new(
-        num_workers: usize,
-        job_repository: Arc<dyn JobRepository>,
+        dispatch: Arc<dyn JobDispatch>,
+        state: Arc<dyn JobState>,
         registry: TaskRegistry,
     ) -> Result<Self, QueueError> {
-        Self::with_config(
-            num_workers,
-            job_repository,
-            registry,
-            QueueConfig::default(),
-        )
+        Self::with_config(dispatch, state, registry, QueueConfig::default())
     }
 
     pub fn with_config(
-        num_workers: usize,
-        job_repository: Arc<dyn JobRepository>,
+        dispatch: Arc<dyn JobDispatch>,
+        state: Arc<dyn JobState>,
         registry: TaskRegistry,
         config: QueueConfig,
     ) -> Result<Self, QueueError> {
         config.validate()?;
-        let mut workers = Vec::new();
-        for i in 0..num_workers {
+        let consumer_id = format!(
+            "queue-{}-{}",
+            std::process::id(),
+            generate_job_id().chars().take(8).collect::<String>()
+        );
+        let mut workers = Vec::with_capacity(config.assigned_partitions.len());
+        for (i, p) in config.assigned_partitions.iter().enumerate() {
             workers.push(Arc::new(Mutex::new(Worker {
-                id: format!("worker-{}", i),
+                id: format!("worker-p{p}-{i}"),
                 status: WorkerStatus::Idle,
                 current_job_id: None,
             })));
         }
-        // Restore pending jobs from the repository. JobQueues::push_back routes
-        // each into the level matching its stored priority. No cvar notification
-        // is needed because workers haven't started yet.
-        let jobs_from_repo = job_repository.find_all_pending()?;
-        let mut job_queues = JobQueues::default();
-        for job in jobs_from_repo {
-            job_queues.push_back(job);
-        }
-        let dead_jobs_from_repo = job_repository.find_all_dead_letter()?;
-        let jobs = Arc::new((Mutex::new(job_queues), Condvar::new()));
-        let dead_letter_jobs = Arc::new(Mutex::new(VecDeque::from(dead_jobs_from_repo)));
-
         Ok(Queue {
             workers,
-            jobs,
-            dead_letter_jobs,
-            job_repository,
+            dispatch,
+            state,
             registry: Arc::new(registry),
             config,
             metrics: Arc::new(MetricsCounters::default()),
+            consumer_id,
         })
     }
 
     pub fn metrics_snapshot(&self) -> MetricsSnapshot {
-        let queue_depth = self.len() as u64;
-        let dead_letter_depth = {
-            let dl = self
-                .dead_letter_jobs
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            dl.len() as u64
-        };
+        let queue_depth = self.pending_count().unwrap_or(0);
+        let dead_letter_depth = self
+            .state
+            .find_all_dead_letter()
+            .map(|v| v.len() as u64)
+            .unwrap_or(0);
         let statuses = self.workers.iter().map(|w| {
             let guard = w.lock().unwrap_or_else(|e| e.into_inner());
             guard.status
@@ -92,10 +83,9 @@ impl Queue {
         metrics::build_snapshot(&self.metrics, queue_depth, dead_letter_depth, statuses)
     }
 
-    /// Spawn a background thread that ticks the throughput EWMA and prints a
-    /// metrics snapshot at the given interval. Drop or call
-    /// `MetricsReporterHandle::stop` to terminate cleanly — the loop wakes
-    /// promptly via the cvar instead of waiting out the next sleep.
+    /// Spawn a background thread that ticks the throughput EWMA and prints
+    /// a metrics snapshot at the given interval. Drop or call
+    /// `MetricsReporterHandle::stop` to terminate cleanly.
     pub fn start_metrics_reporter(self: &Arc<Self>, interval: Duration) -> MetricsReporterHandle {
         let queue = Arc::clone(self);
         let stop = Arc::new((Mutex::new(false), Condvar::new()));
@@ -124,20 +114,24 @@ impl Queue {
         }
     }
 
-    pub fn len(&self) -> usize {
-        let (lock, _) = &*self.jobs;
-        let jobs = lock.lock().unwrap_or_else(|e| e.into_inner());
-        jobs.len()
+    pub fn start_reaper(self: &Arc<Self>) -> ReaperHandle {
+        let reaper = Reaper::new(
+            Arc::clone(&self.dispatch),
+            Arc::clone(&self.state),
+            self.config.assigned_partitions.clone(),
+            self.config.claim_lease,
+        );
+        ReaperHandle {
+            inner: ReaperThread::spawn(reaper, self.config.reaper_interval),
+        }
     }
 
     pub fn pending_count(&self) -> Result<u64, QueueError> {
-        self.job_repository.pending_count()
+        self.dispatch.pending_count()
     }
 
-    pub fn is_empty(&self) -> bool {
-        let (lock, _) = &*self.jobs;
-        let jobs = lock.lock().unwrap_or_else(|e| e.into_inner());
-        jobs.is_empty()
+    pub fn is_empty(&self) -> Result<bool, QueueError> {
+        Ok(self.pending_count()? == 0)
     }
 
     pub fn enqueue_by_name<P: serde::Serialize>(
@@ -150,8 +144,7 @@ impl Queue {
     }
 
     /// Dynamic-dispatch sibling of `enqueue_by_name` that also sets
-    /// `max_attempts` and `priority` — the same knobs the `#[task(...)]`
-    /// macro exposes for statically-known tasks.
+    /// `max_attempts` and `priority`.
     pub fn enqueue_by_name_with_opts<P: serde::Serialize>(
         &self,
         task_name: &str,
@@ -177,19 +170,21 @@ impl Queue {
         }
         let json = serde_json::to_string(&payload)
             .map_err(|e| QueueError::JobFailed(format!("serialize {task_name}: {e}")))?;
-        let job_id = generate_job_id();
-        Ok(Job::with_task_name(job_id, task_name.to_string(), json))
+        Ok(Job::with_task_name(
+            generate_job_id(),
+            task_name.to_string(),
+            json,
+        ))
     }
 
-    /// Enqueue a job. The level it lands in is determined by `job.priority`
-    /// — persistence and in-memory routing agree on a single source of truth.
+    /// Persist initial state, then route the job to its partition's
+    /// dispatch backend. Ordering matters: if dispatch.enqueue races a
+    /// worker before state is written, the worker can find_by_id and see
+    /// nothing — so state.save_initial happens first.
     pub fn enqueue(&self, job: Job) -> Result<(), QueueError> {
-        self.job_repository.save(&job)?;
-        let (lock, cvar) = &*self.jobs;
-        let mut jobs = lock.lock()?;
-        jobs.push_back(job);
-        cvar.notify_one();
-        Ok(())
+        self.state.save_initial(&job)?;
+        let partition = partition::partition_for(&job.id, self.config.partition_count);
+        self.dispatch.enqueue(partition, &job)
     }
 
     /// Convenience wrapper: force the job to `High` priority and enqueue.
@@ -200,56 +195,39 @@ impl Queue {
 
     /// Cancel a job by id.
     ///
-    /// - `Pending`: removed from the in-memory level and marked `Cancelled`.
-    /// - `Running`: marked `Cancelled`. An in-flight consumer call is not
-    ///   preempted and may still produce a result, but the repository's
-    ///   sticky-Cancelled guard rejects any subsequent status write — so the
-    ///   DB always reflects `Cancelled` once `cancel()` returns Ok.
+    /// - `Pending`/`Running`: sets status to `Cancelled` in state. The
+    ///   sticky-Cancelled guard in `JobState::save_status` ensures any
+    ///   later status write from the worker is dropped. We don't try to
+    ///   evict the stream entry — workers re-check status before running
+    ///   the handler and ack the entry as a no-op.
     /// - Terminal states (`Completed`/`Failed`/`Cancelled`): returns
     ///   `CannotCancel` so callers can distinguish a no-op from success.
     pub fn cancel(&self, job_id: &str) -> Result<(), QueueError> {
-        let job = self.job_repository.find_by_id(job_id)?;
+        let job = self.state.find_by_id(job_id)?;
         match job.status {
-            JobStatus::Pending => {
-                let (lock, _) = &*self.jobs;
-                let mut jobs = lock.lock()?;
-                jobs.remove(job_id);
+            JobStatus::Pending | JobStatus::Running => {
+                self.state.save_status(job_id, JobStatus::Cancelled)
             }
-            JobStatus::Running => {}
-            terminal => {
-                return Err(QueueError::CannotCancel {
-                    id: job_id.to_string(),
-                    status: terminal,
-                });
-            }
+            terminal => Err(QueueError::CannotCancel {
+                id: job_id.to_string(),
+                status: terminal,
+            }),
         }
-        self.job_repository
-            .update_status(job_id, JobStatus::Cancelled)
     }
 
     pub fn start_workers(self: &Arc<Self>) {
-        for worker in &self.workers {
+        for (worker, &partition) in self
+            .workers
+            .iter()
+            .zip(self.config.assigned_partitions.iter())
+        {
             let consumer = RegistryConsumer::new(Arc::clone(&self.registry));
             let worker = Arc::clone(worker);
-            let jobs = Arc::clone(&self.jobs);
             let queue = Arc::clone(self);
             thread::spawn(move || {
-                loop {
-                    if let Some(job) = Self::wait_for_job(&jobs) {
-                        worker::process_job(&worker, &consumer, job, &queue);
-                    }
-                }
+                worker::run_partition_loop(&queue, &worker, &consumer, partition);
             });
         }
-    }
-
-    pub(crate) fn wait_for_job(jobs: &(Mutex<JobQueues>, Condvar)) -> Option<Job> {
-        let (lock, cvar) = jobs;
-        let mut jobs = lock.lock().unwrap_or_else(|e| e.into_inner());
-        while jobs.is_empty() {
-            jobs = cvar.wait(jobs).unwrap_or_else(|e| e.into_inner());
-        }
-        jobs.pop_next()
     }
 }
 
@@ -281,6 +259,16 @@ impl Drop for MetricsReporterHandle {
         if self.join.is_some() {
             self.signal_stop();
         }
+    }
+}
+
+pub struct ReaperHandle {
+    inner: ReaperThread,
+}
+
+impl ReaperHandle {
+    pub fn stop(self) {
+        self.inner.stop();
     }
 }
 

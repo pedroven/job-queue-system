@@ -3,12 +3,17 @@ use std::time::{Duration, SystemTime};
 
 use job_queue_system::error::QueueError;
 use job_queue_system::models::JobPriority;
+use job_queue_system::persistence::{
+    self, JobDispatch, JobState, RedisDispatchConfig, RedisJobDispatch, RedisJobState,
+    SqliteJobDispatch, SqliteJobState,
+};
 use job_queue_system::producer::JobProducer;
 use job_queue_system::scheduler::{
-    ScheduledJob, ScheduledJobRepository, Scheduler, SqliteScheduledJobRepository,
+    AlwaysOnLease, RedisSchedulerLease, ScheduledJob, ScheduledJobRepository, Scheduler,
+    SchedulerLease, SqliteScheduledJobRepository,
 };
 use job_queue_system::task_registry;
-use job_queue_system::{persistence, queue, task};
+use job_queue_system::{queue, task};
 
 #[task(max_attempts = 5, priority = JobPriority::High)]
 fn send_email(to: String) -> Result<(), QueueError> {
@@ -30,27 +35,59 @@ fn sum_two_numbers(a: &i32, b: &i32) -> i32 {
 }
 
 fn main() {
-    let db_path = std::env::var("JOB_QUEUE_DB").unwrap_or_else(|_| "jobs.db".to_string());
-    let job_repository: Arc<dyn persistence::JobRepository> =
-        Arc::new(persistence::SqliteJobRepository::new(&db_path).expect("Failed to open database"));
-
-    let num_workers = 4;
     let registry = task_registry![send_email, process_image, sum_two_numbers];
-    let queue = Arc::new(
-        queue::Queue::new(num_workers, Arc::clone(&job_repository), registry)
-            .expect("Failed to initialize queue"),
-    );
+
+    // Backend selection: `JOB_QUEUE_REDIS_URL` flips on Redis dispatch and
+    // state. Otherwise default to SQLite single-partition.
+    let backend = std::env::var("JOB_QUEUE_REDIS_URL").ok();
+    let partition_count: u32 = std::env::var("JOB_QUEUE_PARTITIONS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+    let config = queue::QueueConfig {
+        partition_count,
+        assigned_partitions: (0..partition_count).collect(),
+        ..Default::default()
+    };
+
+    let (dispatch, state): (Arc<dyn JobDispatch>, Arc<dyn JobState>) = match &backend {
+        Some(url) => {
+            let cfg = RedisDispatchConfig::new(url.as_str(), partition_count);
+            let d = RedisJobDispatch::new(cfg).expect("connect redis dispatch");
+            let s = RedisJobState::new(url).expect("connect redis state");
+            (Arc::new(d), Arc::new(s))
+        }
+        None => {
+            let db_path = std::env::var("JOB_QUEUE_DB").unwrap_or_else(|_| "jobs.db".to_string());
+            let d =
+                SqliteJobDispatch::new(&db_path, partition_count).expect("open sqlite dispatch");
+            let s = SqliteJobState::new(&db_path).expect("open sqlite state");
+            (Arc::new(d), Arc::new(s))
+        }
+    };
+    let _ = persistence::InMemoryJobState::new; // suppress unused-import warning if applicable
+
+    let queue =
+        Arc::new(queue::Queue::with_config(dispatch, state, registry, config).expect("init queue"));
     queue.start_workers();
     let _metrics_handle = queue.start_metrics_reporter(Duration::from_secs(10));
+    let _reaper_handle = queue.start_reaper();
     task::set_global_queue(Arc::clone(&queue)).expect("global queue already installed");
 
+    let db_path = std::env::var("JOB_QUEUE_DB").unwrap_or_else(|_| "jobs.db".to_string());
     let scheduled_repo: Arc<dyn ScheduledJobRepository> = Arc::new(
         SqliteScheduledJobRepository::new(&db_path).expect("Failed to open scheduled_jobs store"),
     );
     seed_default_schedules(scheduled_repo.as_ref());
 
     let producer = Arc::new(JobProducer::new(Arc::clone(&queue)));
-    let scheduler = Scheduler::new(Arc::clone(&scheduled_repo), producer);
+    let lease: Arc<dyn SchedulerLease> = match &backend {
+        Some(url) => Arc::new(
+            RedisSchedulerLease::new(url, "scheduler:lease").expect("connect scheduler lease"),
+        ),
+        None => Arc::new(AlwaysOnLease),
+    };
+    let scheduler = Scheduler::new(Arc::clone(&scheduled_repo), producer, lease);
     let _scheduler_handle = scheduler.start(Duration::from_secs(1));
 
     loop {
@@ -79,13 +116,6 @@ fn main() {
     }
 }
 
-/// Registers the demo recurring schedules on first boot only. Uses
-/// `save_if_absent` so restarts don't clobber persisted `last_run_at` /
-/// `next_run_at` progress on rows the scheduler has already advanced.
-///
-/// Cron dialect: 7 fields — `sec min hour dom mon dow year` — driven by the
-/// `cron` crate. This is NOT standard 5-field Unix cron; pasting `"*/5 * * * *"`
-/// will fail with `QueueError::InvalidCron`.
 fn seed_default_schedules(repo: &dyn ScheduledJobRepository) {
     let specs = [
         (

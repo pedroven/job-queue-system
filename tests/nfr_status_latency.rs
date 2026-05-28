@@ -1,23 +1,11 @@
-//! Status-query latency NFR: `JobRepository::find_by_id` p99 < 100ms.
-//!
-//! Marked `#[ignore]` because:
-//! - The measurement is meaningful only in `--release`.
-//! - It depends on disk read latency, so it's environment-sensitive.
-//!
-//! Run with:
-//!   cargo test --release --test nfr_status_latency -- --ignored --nocapture
-//!
-//! The 100ms ceiling is loose by design — PK lookups on a WAL'd SQLite
-//! should land in microseconds, so this is a regression guard, not a tight
-//! benchmark. If it ever fires, something has gone very wrong (missing
-//! index, accidental full scan).
+//! Status-query latency NFR: `JobState::find_by_id` p99 < 100ms.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use job_queue_system::models::Job;
-use job_queue_system::persistence::{JobRepository, SqliteJobRepository};
+use job_queue_system::persistence::{JobState, SqliteJobState};
 
 struct TempDb {
     path: PathBuf,
@@ -58,30 +46,29 @@ fn nfr_status_query_p99_under_100ms() {
     const SAMPLES: usize = 5_000;
 
     let db = TempDb::new("latency");
-    let repo = SqliteJobRepository::new(db.as_str()).expect("open sqlite");
-    let repo: Arc<dyn JobRepository> = Arc::new(repo);
+    let state = SqliteJobState::new(db.as_str()).expect("open sqlite");
+    let state: Arc<dyn JobState> = Arc::new(state);
 
     for i in 0..SEED {
-        repo.save(&Job::with_task_name(
-            format!("job-{i}"),
-            "nfr_bench".into(),
-            "p".into(),
-        ))
-        .expect("seed");
+        state
+            .save_initial(&Job::with_task_name(
+                format!("job-{i}"),
+                "nfr_bench".into(),
+                "p".into(),
+            ))
+            .expect("seed");
     }
 
-    // Pseudorandom-but-deterministic id sampling via a 64-bit LCG. Avoids
-    // pulling in `rand` just for this and keeps the bench reproducible.
     let mut latencies = Vec::with_capacity(SAMPLES);
-    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut s: u64 = 0x9E37_79B9_7F4A_7C15;
     for _ in 0..SAMPLES {
-        state = state
+        s = s
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
-        let pick = ((state >> 32) as usize) % SEED;
+        let pick = ((s >> 32) as usize) % SEED;
         let id = format!("job-{pick}");
         let start = Instant::now();
-        repo.find_by_id(&id).expect("find_by_id");
+        state.find_by_id(&id).expect("find_by_id");
         latencies.push(start.elapsed());
     }
 

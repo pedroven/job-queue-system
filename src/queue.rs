@@ -1,10 +1,11 @@
 mod config;
 mod core;
-mod levels;
 mod metrics;
+mod partition;
+mod reaper;
 mod worker;
 
 pub use config::QueueConfig;
-pub use core::{MetricsReporterHandle, Queue};
-pub use levels::JobQueues;
+pub use core::{MetricsReporterHandle, Queue, ReaperHandle};
 pub use metrics::MetricsSnapshot;
+pub use partition::partition_for;

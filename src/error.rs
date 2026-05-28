@@ -5,6 +5,7 @@ use crate::models::JobStatus;
 #[derive(Debug)]
 pub enum QueueError {
     Sqlite(rusqlite::Error),
+    Redis(String),
     LockPoisoned,
     NotFound(String),
     AlreadyExists(String),
@@ -14,6 +15,7 @@ pub enum QueueError {
     QueueFull { depth: u64, hard_threshold: u64 },
     InvalidConfig(String),
     InvalidCron(String),
+    InvalidPartition { partition: u32, count: u32 },
     CannotCancel { id: String, status: JobStatus },
 }
 
@@ -21,6 +23,7 @@ impl fmt::Display for QueueError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             QueueError::Sqlite(e) => write!(f, "database error: {e}"),
+            QueueError::Redis(msg) => write!(f, "redis error: {msg}"),
             QueueError::LockPoisoned => write!(f, "lock poisoned"),
             QueueError::NotFound(id) => write!(f, "job not found: {id}"),
             QueueError::AlreadyExists(id) => write!(f, "job already exists: {id}"),
@@ -39,6 +42,9 @@ impl fmt::Display for QueueError {
             QueueError::CannotCancel { id, status } => {
                 write!(f, "cannot cancel job {id} in status {status}")
             }
+            QueueError::InvalidPartition { partition, count } => {
+                write!(f, "partition {partition} out of range (count={count})")
+            }
         }
     }
 }
@@ -55,6 +61,12 @@ impl std::error::Error for QueueError {
 impl From<rusqlite::Error> for QueueError {
     fn from(e: rusqlite::Error) -> Self {
         QueueError::Sqlite(e)
+    }
+}
+
+impl From<redis::RedisError> for QueueError {
+    fn from(e: redis::RedisError) -> Self {
+        QueueError::Redis(e.to_string())
     }
 }
 
